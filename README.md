@@ -81,14 +81,49 @@ sudo kextload /Library/Extensions/osxfusefs.kext
 
 ### 3. Build libsmb2
 
-Compile and install the bundled library. For more detailed information, please refer to the instructions in the original [libsmb2 repository](https://github.com/sahlberg/libsmb2).
+Compile and install the bundled library.
+
+#### 3a. Find your macOS SDK path
+
+The build needs the macOS SDK to locate the `CommonCrypto` headers used for SMB3 AES encryption. Find the path on your machine:
+
+```bash
+find /Applications/Xcode.app -name "CommonCrypto.h" 2>/dev/null
+```
+
+The path will look like:
+```
+/Applications/Xcode.app/Contents/Developer/Platforms/MacOSX.platform/Developer/SDKs/MacOSX10.8.sdk/usr/include/CommonCrypto/CommonCrypto.h
+```
+
+Take the portion up to and including `usr/include` — that is your `SDK_INCLUDE` path.
+
+#### 3b. Bootstrap and configure
 
 ```bash
 cd libsmb2
+chmod +x bootstrap
 ./bootstrap
-./configure --prefix=/usr/local
+./configure --prefix=/usr/local \
+    --without-libkrb5 \
+    CFLAGS="-idirafter <SDK_INCLUDE> -D_FILE_OFFSET_BITS=64"
+```
+
+Replace `<SDK_INCLUDE>` with the path found above, for example:
+```
+-idirafter /Applications/Xcode.app/Contents/Developer/Platforms/MacOSX.platform/Developer/SDKs/MacOSX10.8.sdk/usr/include
+```
+
+**Why these flags:**
+- `--without-libkrb5`: disables Kerberos/GSSAPI support. This project uses NTLM authentication only, and the macOS GSS framework headers are not compatible with this GCC version.
+- `-idirafter <SDK_INCLUDE>`: makes `CommonCrypto/CommonCrypto.h` (needed for AES) findable without overriding system headers. Using `-I` instead causes conflicts with GCC built-ins in the SDK's `ctype.h`.
+
+#### 3c. Build and install
+
+```bash
 make
 sudo make install
+cd ..
 ```
 
 ### 4. Build smb2fuse
@@ -98,12 +133,14 @@ gcc -o smb2fs smb2fs.c \
     -I/opt/local/include/osxfuse/fuse \
     -I/opt/local/include/osxfuse \
     -I/usr/local/include \
-    -L/usr/local/lib -lsmb2 \
+    /usr/local/lib/libsmb2.a \
     -L/opt/local/lib -losxfuse \
     -D_FILE_OFFSET_BITS=64
 ```
 
-The `-D_FILE_OFFSET_BITS=64` flag is required to support files larger than 2 GB. If you installed libsmb2 via MacPorts, adjust the `-I` and `-L` paths to `/opt/local/include` and `/opt/local/lib`.
+The `-D_FILE_OFFSET_BITS=64` flag is required to support files larger than 2 GB.
+
+> **Note:** libsmb2 is linked as a static archive (`/usr/local/lib/libsmb2.a`) rather than via `-lsmb2`. On this toolchain the dynamic library does not export all symbols, so the static archive must be specified directly.
 
 ---
 

@@ -294,6 +294,7 @@ int main(int argc, char *argv[])
         fprintf(stderr, "Connect failed: %s\n", smb2_get_error(smb2_ctx));
         if (cfg.password) {
             secure_zero(cfg.password, strlen(cfg.password));
+            free(cfg.password);
             cfg.password = NULL;
         }
         smb2_destroy_context(smb2_ctx);
@@ -303,6 +304,7 @@ int main(int argc, char *argv[])
     /* Authentication complete — clear the plaintext password from memory */
     if (cfg.password) {
         secure_zero(cfg.password, strlen(cfg.password));
+        free(cfg.password);
         cfg.password = NULL;
     }
 
