@@ -24,6 +24,15 @@ Supported operations: `read`, `write`, `create`, `truncate`, `unlink`, `mkdir`, 
 
 ---
 
+## Getting the source
+
+```bash
+git clone --recurse-submodules https://github.com/GabrielePintus/smb2fuse.git
+cd smb2fuse
+```
+
+---
+
 ## Installing prerequisites
 
 ### 1. Xcode and Command Line Tools
@@ -68,10 +77,9 @@ sudo kextload /Library/Extensions/osxfusefs.kext
 
 ### 4. libsmb2
 
-Clone and build from source:
+libsmb2 is included as a git submodule. After cloning smb2fuse (see below), build and install it:
 
 ```bash
-git clone https://github.com/sahlberg/libsmb2.git
 cd libsmb2
 ./bootstrap
 ./configure --prefix=/usr/local
@@ -79,7 +87,7 @@ make
 sudo make install
 ```
 
-for more details follow the instructions in the repo.
+For more details see the [libsmb2 repository](https://github.com/GabrielePintus/libsmb2).
 
 
 ---
@@ -138,6 +146,13 @@ umount ~/mnt
 
 ---
 
+## Credits
+
+This project uses [libsmb2](https://github.com/sahlberg/libsmb2), originally developed by **Ronnie Sahlberg**. libsmb2 is licensed under the GNU Lesser General Public License v2.1 (LGPL-2.1). The copy included here as a submodule is a fork that contains modifications specific to this project; the original source and documentation can be found at the link above.
+
+---
+
 ## License
 
-MIT — see [LICENSE](LICENSE).
+smb2fuse itself is MIT licensed — see [LICENSE](LICENSE).
+libsmb2 (included as a submodule) is LGPL-2.1 — see the headers in `libsmb2/` for the full license text.
