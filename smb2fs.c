@@ -1,6 +1,6 @@
 /* smb2fs.c - FUSE filesystem for SMB2 shares using libsmb2
  *
- * Usage: smb2fs <mountpoint> -o server=HOST,share=SHARE,user=USER,password=PASS[,domain=DOMAIN]
+ * Usage: smb2fs <mountpoint> -o server=HOST,share=SHARE,user=USER[,password=PASS][,domain=DOMAIN]
  *
  * Build on macOS with OSXFUSE:
  *   gcc -o smb2fs smb2fs.c \
@@ -11,6 +11,10 @@
  */
 
 #define FUSE_USE_VERSION 26
+
+#ifndef _FILE_OFFSET_BITS
+#define _FILE_OFFSET_BITS 64
+#endif
 
 #include <stdint.h>
 #include <stddef.h>
@@ -81,6 +85,28 @@ static void smb2fs_free_config(void)
     }
     free(cfg.domain);
     cfg.domain = NULL;
+}
+
+/* Overwrite password=... segments in argv to reduce command-line exposure. */
+static void scrub_password_argv(struct fuse_args *args)
+{
+    int i;
+
+    for (i = 0; i < args->argc; i++) {
+        char *arg = args->argv[i];
+        char *p;
+
+        if (!arg)
+            continue;
+
+        p = strstr(arg, "password=");
+        while (p) {
+            p += strlen("password=");
+            while (*p && *p != ',')
+                *p++ = 'x';
+            p = strstr(p, "password=");
+        }
+    }
 }
 
 #define SMB2FS_OPT(t, p) { t, offsetof(struct smb2fs_config, p), 1 }
@@ -206,12 +232,19 @@ static int smb2fs_open(const char *path, struct fuse_file_info *fi)
 static int smb2fs_create(const char *path, mode_t mode, struct fuse_file_info *fi)
 {
     const char *smb_path = smb2path(path);
-    (void)mode;
+    int flags;
+
     if (!smb_path)
         return -EINVAL;
 
+    flags = fi ? (fi->flags & O_ACCMODE) : O_WRONLY;
+    if (flags != O_RDONLY && flags != O_WRONLY && flags != O_RDWR)
+        flags = O_WRONLY;
+    if ((mode & 0222) == 0)
+        flags = O_RDONLY;
+
     struct smb2fh *fh = smb2_open(smb2_ctx, smb_path,
-                                   O_CREAT | O_WRONLY | O_TRUNC);
+                                   O_CREAT | O_TRUNC | flags);
     if (fh == NULL)
         return smb2fs_errno();
 
@@ -376,10 +409,11 @@ int main(int argc, char *argv[])
         smb2fs_free_config();
         return 1;
     }
+    scrub_password_argv(&args);
 
     if (!cfg.server || !cfg.share || !cfg.user) {
         fprintf(stderr,
-            "Usage: %s <mountpoint> -o server=HOST,share=SHARE,user=USER,password=PASS[,domain=DOMAIN]\n",
+            "Usage: %s <mountpoint> -o server=HOST,share=SHARE,user=USER[,password=PASS][,domain=DOMAIN]\n",
             argv[0]);
         fuse_opt_free_args(&args);
         smb2fs_free_config();

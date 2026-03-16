@@ -138,7 +138,7 @@ gcc -o smb2fs smb2fs.c \
     -D_FILE_OFFSET_BITS=64
 ```
 
-The `-D_FILE_OFFSET_BITS=64` flag is required to support files larger than 2 GB.
+`_FILE_OFFSET_BITS=64` is required to support files larger than 2 GB. The source now defines it by default, but keeping the compile flag is still recommended for clarity.
 
 > **Note:** libsmb2 is linked as a static archive (`/usr/local/lib/libsmb2.a`) rather than via `-lsmb2`. On this toolchain the dynamic library does not export all symbols, so the static archive must be specified directly.
 
@@ -150,15 +150,17 @@ Create a mount point and run `smb2fs`:
 
 ```bash
 mkdir ~/mnt
-./smb2fs ~/mnt -o server=192.168.1.1,share=MyShare,user=alice,password=secret,domain=MYDOMAIN
+./smb2fs ~/mnt -o server=192.168.1.1,share=MyShare,user=alice,domain=MYDOMAIN
 ```
+
+For better security, avoid passing `password=...` on the command line. Use `~/.nsmbrc` (`DOMAIN:USERNAME:PASSWORD`) or another credential source supported by your environment.
 
 | Option     | Required | Description                          |
 |------------|----------|--------------------------------------|
 | `server`   | yes      | IP address or hostname of the server |
 | `share`    | yes      | Name of the SMB share                |
 | `user`     | yes      | Username                             |
-| `password` | no       | Password (omit to leave blank)       |
+| `password` | no       | Password (avoid command line if possible) |
 | `domain`   | no       | Windows/AD domain name               |
 
 To unmount:
