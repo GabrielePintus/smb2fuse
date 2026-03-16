@@ -106,7 +106,7 @@ chmod +x bootstrap
 ./bootstrap
 ./configure --prefix=/usr/local \
     --without-libkrb5 \
-    CFLAGS="-idirafter <SDK_INCLUDE> -D_FILE_OFFSET_BITS=64"
+    CFLAGS="-O2 -idirafter <SDK_INCLUDE> -D_FILE_OFFSET_BITS=64"
 ```
 
 Replace `<SDK_INCLUDE>` with the path found above, for example:
@@ -116,6 +116,7 @@ Replace `<SDK_INCLUDE>` with the path found above, for example:
 
 **Why these flags:**
 - `--without-libkrb5`: disables Kerberos/GSSAPI support. This project uses NTLM authentication only, and the macOS GSS framework headers are not compatible with this GCC version.
+- `-O2`: enables stable compiler optimizations on GCC 4.2.1; this guide intentionally avoids `-O3` on the legacy toolchain.
 - `-idirafter <SDK_INCLUDE>`: makes `CommonCrypto/CommonCrypto.h` (needed for AES) findable without overriding system headers. Using `-I` instead causes conflicts with GCC built-ins in the SDK's `ctype.h`.
 
 #### 3c. Build and install
@@ -130,17 +131,29 @@ cd ..
 
 ```bash
 gcc -o smb2fs smb2fs.c \
-    -I/opt/local/include/osxfuse/fuse \
-    -I/opt/local/include/osxfuse \
+    -I/usr/local/include/osxfuse/fuse \
+    -I/usr/local/include/osxfuse \
     -I/usr/local/include \
     /usr/local/lib/libsmb2.a \
-    -L/opt/local/lib -losxfuse \
+    /usr/local/lib/libosxfuse.2.dylib \
+    -Wl,-rpath,/usr/local/lib \
+    -O2 \
     -D_FILE_OFFSET_BITS=64
 ```
 
 `_FILE_OFFSET_BITS=64` is required to support files larger than 2 GB. The source now defines it by default, but keeping the compile flag is still recommended for clarity.
 
 > **Note:** libsmb2 is linked as a static archive (`/usr/local/lib/libsmb2.a`) rather than via `-lsmb2`. On this toolchain the dynamic library does not export all symbols, so the static archive must be specified directly.
+
+> **Important (OSXFUSE linkage):** If both `/opt/local` and `/usr/local` OSXFUSE libraries are installed, link `smb2fs` against `/usr/local/lib/libosxfuse.2.dylib`. Linking against `/opt/local/lib/libosxfuse.2.dylib` can cause mount handoff failure with:
+> `This program is not meant to be called directly. The OSXFUSE library calls it.`
+>
+> Verify the binary with:
+> ```bash
+> otool -L ./smb2fs | egrep -i 'osxfuse|fuse'
+> ```
+> Expected:
+> `... /usr/local/lib/libosxfuse.2.dylib ...`
 
 ---
 
@@ -153,7 +166,17 @@ mkdir ~/mnt
 ./smb2fs ~/mnt -o server=192.168.1.1,share=MyShare,user=alice,domain=MYDOMAIN
 ```
 
-For better security, avoid passing `password=...` on the command line. Use `~/.nsmbrc` (`DOMAIN:USERNAME:PASSWORD`) or another credential source supported by your environment.
+For better security, avoid passing `password=...` on the command line. Prefer one of:
+
+```bash
+# Interactive prompt (no password in argv/history)
+./smb2fs ~/mnt -o server=192.168.1.1,share=MyShare,user=alice,password_prompt,domain=MYDOMAIN
+
+# File descriptor (example uses stdin as fd 0)
+printf '%s' 'secret' | ./smb2fs ~/mnt -o server=192.168.1.1,share=MyShare,user=alice,passfd=0,domain=MYDOMAIN
+```
+
+You can also use `~/.nsmbrc` (`DOMAIN:USERNAME:PASSWORD`) if preferred.
 
 | Option     | Required | Description                          |
 |------------|----------|--------------------------------------|
@@ -161,7 +184,11 @@ For better security, avoid passing `password=...` on the command line. Use `~/.n
 | `share`    | yes      | Name of the SMB share                |
 | `user`     | yes      | Username                             |
 | `password` | no       | Password (avoid command line if possible) |
+| `passfd`   | no       | Read password from file descriptor     |
+| `password_prompt` | no | Read password via interactive prompt |
 | `domain`   | no       | Windows/AD domain name               |
+
+Use only one password source at a time: `password`, `passfd`, or `password_prompt`.
 
 To unmount:
 
