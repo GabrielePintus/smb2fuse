@@ -26,8 +26,25 @@
 
 #include <smb2/smb2.h>
 #include <smb2/libsmb2.h>
+#include <smb2/smb2-errors.h>
 
 static struct smb2_context *smb2_ctx = NULL;
+
+/* Securely zero memory without compiler elision. */
+static void secure_zero(void *ptr, size_t len)
+{
+    volatile unsigned char *p = (volatile unsigned char *)ptr;
+    while (len--) *p++ = 0;
+}
+
+/* Map the last libsmb2 NT error to a POSIX errno value. */
+static int smb2fs_errno(void)
+{
+    int nterr = smb2_get_nterror(smb2_ctx);
+    if (nterr)
+        return -nterror_to_errno((uint32_t)nterr);
+    return -EIO;
+}
 
 struct smb2fs_config {
     char *server;
@@ -86,7 +103,7 @@ static int smb2fs_getattr(const char *path, struct stat *stbuf)
 
     struct smb2_stat_64 st;
     if (smb2_stat(smb2_ctx, smb2path(path), &st) < 0)
-        return -ENOENT;
+        return smb2fs_errno();
 
     smb2stat_to_stat(&st, stbuf);
     return 0;
@@ -99,7 +116,7 @@ static int smb2fs_readdir(const char *path, void *buf, fuse_fill_dir_t filler,
 
     struct smb2dir *dir = smb2_opendir(smb2_ctx, smb2path(path));
     if (dir == NULL)
-        return -ENOENT;
+        return smb2fs_errno();
 
     filler(buf, ".",  NULL, 0);
     filler(buf, "..", NULL, 0);
@@ -126,7 +143,7 @@ static int smb2fs_open(const char *path, struct fuse_file_info *fi)
 
     struct smb2fh *fh = smb2_open(smb2_ctx, smb2path(path), flags);
     if (fh == NULL)
-        return -ENOENT;
+        return smb2fs_errno();
 
     fi->fh = (uint64_t)(uintptr_t)fh;
     return 0;
@@ -138,7 +155,7 @@ static int smb2fs_create(const char *path, mode_t mode, struct fuse_file_info *f
     struct smb2fh *fh = smb2_open(smb2_ctx, smb2path(path),
                                    O_CREAT | O_WRONLY | O_TRUNC);
     if (fh == NULL)
-        return -EIO;
+        return smb2fs_errno();
 
     fi->fh = (uint64_t)(uintptr_t)fh;
     return 0;
@@ -151,10 +168,10 @@ static int smb2fs_read(const char *path, char *buf, size_t size, off_t offset,
     struct smb2fh *fh = (struct smb2fh *)(uintptr_t)fi->fh;
 
     if (smb2_lseek(smb2_ctx, fh, offset, SEEK_SET, NULL) < 0)
-        return -EIO;
+        return smb2fs_errno();
 
     int ret = smb2_read(smb2_ctx, fh, (uint8_t *)buf, size);
-    return (ret < 0) ? -EIO : ret;
+    return (ret < 0) ? smb2fs_errno() : ret;
 }
 
 static int smb2fs_write(const char *path, const char *buf, size_t size,
@@ -164,10 +181,10 @@ static int smb2fs_write(const char *path, const char *buf, size_t size,
     struct smb2fh *fh = (struct smb2fh *)(uintptr_t)fi->fh;
 
     if (smb2_lseek(smb2_ctx, fh, offset, SEEK_SET, NULL) < 0)
-        return -EIO;
+        return smb2fs_errno();
 
     int ret = smb2_write(smb2_ctx, fh, (uint8_t *)buf, size);
-    return (ret < 0) ? -EIO : ret;
+    return (ret < 0) ? smb2fs_errno() : ret;
 }
 
 static int smb2fs_release(const char *path, struct fuse_file_info *fi)
@@ -181,14 +198,14 @@ static int smb2fs_release(const char *path, struct fuse_file_info *fi)
 static int smb2fs_truncate(const char *path, off_t size)
 {
     if (smb2_truncate(smb2_ctx, smb2path(path), (uint64_t)size) < 0)
-        return -EIO;
+        return smb2fs_errno();
     return 0;
 }
 
 static int smb2fs_unlink(const char *path)
 {
     if (smb2_unlink(smb2_ctx, smb2path(path)) < 0)
-        return -EIO;
+        return smb2fs_errno();
     return 0;
 }
 
@@ -196,21 +213,21 @@ static int smb2fs_mkdir(const char *path, mode_t mode)
 {
     (void)mode;
     if (smb2_mkdir(smb2_ctx, smb2path(path)) < 0)
-        return -EIO;
+        return smb2fs_errno();
     return 0;
 }
 
 static int smb2fs_rmdir(const char *path)
 {
     if (smb2_rmdir(smb2_ctx, smb2path(path)) < 0)
-        return -EIO;
+        return smb2fs_errno();
     return 0;
 }
 
 static int smb2fs_rename(const char *from, const char *to)
 {
     if (smb2_rename(smb2_ctx, smb2path(from), smb2path(to)) < 0)
-        return -EIO;
+        return smb2fs_errno();
     return 0;
 }
 
@@ -219,7 +236,7 @@ static int smb2fs_statfs(const char *path, struct statvfs *stv)
     (void)path;
     struct smb2_statvfs s2stv;
     if (smb2_statvfs(smb2_ctx, "", &s2stv) < 0)
-        return -EIO;
+        return smb2fs_errno();
 
     memset(stv, 0, sizeof(*stv));
     stv->f_bsize   = s2stv.f_bsize;
@@ -275,8 +292,18 @@ int main(int argc, char *argv[])
 
     if (smb2_connect_share(smb2_ctx, cfg.server, cfg.share, cfg.user) < 0) {
         fprintf(stderr, "Connect failed: %s\n", smb2_get_error(smb2_ctx));
+        if (cfg.password) {
+            secure_zero(cfg.password, strlen(cfg.password));
+            cfg.password = NULL;
+        }
         smb2_destroy_context(smb2_ctx);
         return 1;
+    }
+
+    /* Authentication complete — clear the plaintext password from memory */
+    if (cfg.password) {
+        secure_zero(cfg.password, strlen(cfg.password));
+        cfg.password = NULL;
     }
 
     fprintf(stderr, "Connected to //%s/%s, mounting...\n", cfg.server, cfg.share);
