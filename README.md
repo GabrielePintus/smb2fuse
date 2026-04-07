@@ -133,6 +133,10 @@ cd ..
 make
 ```
 
+From the repository root, `make` now builds both:
+- the CLI `smb2fs`
+- the GUI app under `gui/build/SMB2FUSE.app`
+
 `_FILE_OFFSET_BITS=64` is required to support files larger than 2 GB. The source now defines it by default, but keeping the compile flag is still recommended for clarity.
 
 The root `Makefile` uses the same flags shown below and defaults to `PREFIX=/usr/local`. If needed, you can override it:
@@ -241,8 +245,6 @@ A separate native AppKit wrapper lives under [gui/README.md](/home/gabrielepintu
 Build it separately after the CLI:
 
 ```bash
-make
-cd gui
 make
 ```
 

@@ -12,15 +12,21 @@ LDFLAGS += -Wl,-rpath,$(PREFIX)/lib
 LDLIBS += $(PREFIX)/lib/libsmb2.a \
           $(PREFIX)/lib/libosxfuse.2.dylib
 
-.PHONY: all clean check-link
+.PHONY: all cli gui clean check-link
 
-all: $(TARGET)
+all: cli gui
+
+cli: $(TARGET)
+
+gui:
+	$(MAKE) -C gui
 
 $(TARGET): $(SRC)
 	$(CC) -o $@ $(SRC) $(CPPFLAGS) $(CFLAGS) $(LDLIBS) $(LDFLAGS)
 
 clean:
 	rm -f $(TARGET)
+	$(MAKE) -C gui clean
 
-check-link: $(TARGET)
+check-link: cli
 	otool -L ./$(TARGET) | egrep -i 'osxfuse|fuse'
