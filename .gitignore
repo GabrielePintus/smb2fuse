@@ -1,2 +1,10 @@
+# Local mounts and build outputs
 remote/
 smb2fs
+gui/build/
+
+# Local tooling
+.codex
+
+# macOS noise
+.DS_Store

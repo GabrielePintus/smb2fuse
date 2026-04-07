@@ -38,6 +38,15 @@ This is the environment I used. Other configurations may work, but this is what 
 
 ---
 
+## Repository layout
+
+- `smb2fs.c`: the CLI and FUSE filesystem implementation
+- `Makefile`: root build for the CLI
+- `libsmb2/`: bundled `libsmb2` submodule used by the filesystem
+- `gui/`: separate native AppKit GUI wrapper built on top of the CLI
+
+---
+
 ## Installation
 
 ### 1. Clone the repository
@@ -222,6 +231,28 @@ umount ~/mnt
 ```
 
 > **Do not run `smb2fs` with `sudo`.** On Lion, the FUSE mount process needs to run as the logged-in user who owns the FUSE device. Running as root can fail with "Operation not permitted".
+
+---
+
+## Optional GUI
+
+A separate native AppKit wrapper lives under [gui/README.md](/home/gabrielepintus/Downloads/smb2fuse/gui/README.md). It is intentionally a thin launcher around the CLI, with saved connections, share listing, mount/unmount actions, optional Keychain-backed password storage, and a small activity log.
+
+Build it separately after the CLI:
+
+```bash
+make
+cd gui
+make
+```
+
+The resulting app bundle is:
+
+```text
+gui/build/SMB2FUSE.app
+```
+
+The GUI does not replace `smb2fs`; it simply launches the existing executable with `NSTask`.
 
 ---
 

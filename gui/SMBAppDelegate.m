@@ -1,0 +1,2906 @@
+#import "SMBAppDelegate.h"
+
+#include <arpa/inet.h>
+
+#import <Security/Security.h>
+#import <dispatch/dispatch.h>
+
+#ifndef kSecProtocolTypeSMB
+#define kSecProtocolTypeSMB ((SecProtocolType)'smb ')
+#endif
+
+static NSString *const kSMBBookmarkDefaultsKey = @"Bookmarks";
+static NSString *const kSMBConnectionExchangeFormat = @"smb2fuse-connections";
+static NSInteger const kSMBConnectionExchangeVersion = 1;
+static NSInteger const kSMBEditorNameTag = 1001;
+static NSInteger const kSMBEditorServerTag = 1002;
+static NSInteger const kSMBEditorShareTag = 1003;
+static NSInteger const kSMBEditorUserTag = 1004;
+static NSInteger const kSMBEditorDomainTag = 1005;
+static NSInteger const kSMBEditorBrowseSharesTag = 1006;
+static NSInteger const kSMBEditorPasswordStateTag = 1007;
+static NSInteger const kSMBEditorForgetPasswordTag = 1008;
+static NSInteger const kSMBEditorErrorTag = 1099;
+
+typedef enum SMBTaskPurpose {
+    SMBTaskPurposeListShares = 1,
+    SMBTaskPurposeMount = 2,
+    SMBTaskPurposeUnmount = 3
+} SMBTaskPurpose;
+
+@interface SMBHintTextField : NSTextField
+
+@property (copy) NSString *hintString;
+
+@end
+
+@implementation SMBHintTextField
+
+- (void)drawRect:(NSRect)dirtyRect
+{
+    [super drawRect:dirtyRect];
+
+    if ([[self stringValue] length] != 0 || [self currentEditor] != nil || [self.hintString length] == 0) {
+        return;
+    }
+
+    NSDictionary *attrs = [NSDictionary dictionaryWithObjectsAndKeys:
+                           [NSColor grayColor], NSForegroundColorAttributeName,
+                           [self font] ?: [NSFont systemFontOfSize:12.0], NSFontAttributeName,
+                           nil];
+    NSRect bounds = [self bounds];
+    NSPoint point = NSMakePoint(6.0, floor((bounds.size.height - 14.0) / 2.0));
+    [self.hintString drawAtPoint:point withAttributes:attrs];
+}
+
+- (BOOL)becomeFirstResponder
+{
+    BOOL ok = [super becomeFirstResponder];
+    [self setNeedsDisplay:YES];
+    return ok;
+}
+
+- (BOOL)resignFirstResponder
+{
+    BOOL ok = [super resignFirstResponder];
+    [self setNeedsDisplay:YES];
+    return ok;
+}
+
+@end
+
+@interface SMBBookmarkCellView : NSTableCellView
+
+@property (strong) NSImageView *bookmarkIconView;
+@property (strong) NSTextField *titleField;
+@property (strong) NSTextField *subtitleField;
+@property (strong) NSTextField *detailField;
+@property (strong) NSTextField *mountedField;
+
+@end
+
+@implementation SMBBookmarkCellView
+
+- (id)initWithFrame:(NSRect)frameRect
+{
+    self = [super initWithFrame:frameRect];
+    if (!self) {
+        return nil;
+    }
+
+    self.bookmarkIconView = [[NSImageView alloc] initWithFrame:NSMakeRect(14.0, 12.0, 36.0, 36.0)];
+    [self.bookmarkIconView setImageScaling:NSImageScaleProportionallyUpOrDown];
+    [self addSubview:self.bookmarkIconView];
+
+    self.titleField = [self labelWithFrame:NSMakeRect(62.0, 40.0, frameRect.size.width - 120.0, 18.0)
+                                      bold:YES
+                                      size:14.0];
+    [self addSubview:self.titleField];
+
+    self.subtitleField = [self labelWithFrame:NSMakeRect(62.0, 23.0, frameRect.size.width - 120.0, 16.0)
+                                         bold:NO
+                                         size:12.0];
+    [self.subtitleField setTextColor:[NSColor darkGrayColor]];
+    [self addSubview:self.subtitleField];
+
+    self.detailField = [self labelWithFrame:NSMakeRect(62.0, 8.0, frameRect.size.width - 120.0, 14.0)
+                                       bold:NO
+                                       size:11.0];
+    [self.detailField setTextColor:[NSColor grayColor]];
+    [self addSubview:self.detailField];
+
+    self.mountedField = [self labelWithFrame:NSMakeRect(frameRect.size.width - 90.0, 21.0, 76.0, 20.0)
+                                        bold:NO
+                                        size:12.0];
+    [self.mountedField setAlignment:NSRightTextAlignment];
+    [self.mountedField setTextColor:[NSColor colorWithCalibratedRed:0.20 green:0.62 blue:0.20 alpha:1.0]];
+    [self addSubview:self.mountedField];
+
+    return self;
+}
+
+- (void)layout
+{
+    [super layout];
+
+    CGFloat width = [self bounds].size.width;
+    [self.titleField setFrame:NSMakeRect(62.0, 40.0, width - 154.0, 18.0)];
+    [self.subtitleField setFrame:NSMakeRect(62.0, 23.0, width - 154.0, 16.0)];
+    [self.detailField setFrame:NSMakeRect(62.0, 8.0, width - 154.0, 14.0)];
+    [self.mountedField setFrame:NSMakeRect(width - 90.0, 21.0, 76.0, 20.0)];
+}
+
+- (NSTextField *)labelWithFrame:(NSRect)frame bold:(BOOL)bold size:(CGFloat)size
+{
+    NSTextField *label = [[NSTextField alloc] initWithFrame:frame];
+    [label setBordered:NO];
+    [label setEditable:NO];
+    [label setSelectable:NO];
+    [label setDrawsBackground:NO];
+    [label setFont:bold ? [NSFont boldSystemFontOfSize:size] : [NSFont systemFontOfSize:size]];
+    [[label cell] setLineBreakMode:NSLineBreakByTruncatingTail];
+    return label;
+}
+
+@end
+
+@interface SMBAppDelegate ()
+
+@property (strong) NSWindow *window;
+@property (strong) NSTableView *bookmarksTable;
+@property (strong) NSView *emptyStateView;
+@property (strong) NSTextField *statusField;
+@property (strong) NSTextField *countField;
+@property (strong) NSMenu *bookmarksMenu;
+
+@property (strong) NSMutableArray *bookmarks;
+@property (strong) NSMutableDictionary *mountedBookmarkPaths;
+@property (assign) BOOL taskRunning;
+
+@end
+
+@implementation SMBAppDelegate
+
+- (void)applicationDidFinishLaunching:(NSNotification *)notification
+{
+    (void)notification;
+    self.bookmarks = [NSMutableArray array];
+    self.mountedBookmarkPaths = [NSMutableDictionary dictionary];
+
+    [self loadBookmarks];
+    [self installMainMenu];
+    [self buildWindow];
+    [self reloadBookmarkList];
+    [self.window center];
+    [self.window makeKeyAndOrderFront:nil];
+    [NSApp activateIgnoringOtherApps:YES];
+}
+
+- (void)applicationDidBecomeActive:(NSNotification *)notification
+{
+    (void)notification;
+    [self reloadBookmarkList];
+}
+
+- (BOOL)applicationShouldTerminateAfterLastWindowClosed:(NSApplication *)sender
+{
+    (void)sender;
+    return YES;
+}
+
+- (void)buildWindow
+{
+    NSRect frame = NSMakeRect(0.0, 0.0, 760.0, 560.0);
+    self.window = [[NSWindow alloc] initWithContentRect:frame
+                                              styleMask:(NSTitledWindowMask |
+                                                         NSClosableWindowMask |
+                                                         NSMiniaturizableWindowMask |
+                                                         NSResizableWindowMask)
+                                                backing:NSBackingStoreBuffered
+                                                  defer:NO];
+    [self.window setTitle:@"SMB2 FUSE"];
+    [self.window setMinSize:NSMakeSize(640.0, 420.0)];
+    [self.window setDelegate:(id)self];
+
+    NSView *contentView = [self.window contentView];
+    NSRect bounds = [contentView bounds];
+
+    NSScrollView *scrollView = [[NSScrollView alloc] initWithFrame:NSMakeRect(0.0, 34.0, bounds.size.width, bounds.size.height - 34.0)];
+    [scrollView setAutoresizingMask:NSViewWidthSizable | NSViewHeightSizable];
+    [scrollView setBorderType:NSBezelBorder];
+    [scrollView setHasVerticalScroller:YES];
+    [contentView addSubview:scrollView];
+
+    self.bookmarksTable = [[NSTableView alloc] initWithFrame:[[scrollView contentView] bounds]];
+    [self.bookmarksTable setDelegate:self];
+    [self.bookmarksTable setDataSource:self];
+    [self.bookmarksTable setHeaderView:nil];
+    [self.bookmarksTable setRowHeight:60.0];
+    [self.bookmarksTable setIntercellSpacing:NSMakeSize(0.0, 0.0)];
+    [self.bookmarksTable setUsesAlternatingRowBackgroundColors:YES];
+    [self.bookmarksTable setDoubleAction:@selector(activateSelectedBookmark:)];
+    [self.bookmarksTable addTableColumn:[self bookmarkColumn]];
+    [scrollView setDocumentView:self.bookmarksTable];
+
+    self.emptyStateView = [[NSView alloc] initWithFrame:[scrollView frame]];
+    [self.emptyStateView setAutoresizingMask:NSViewWidthSizable | NSViewHeightSizable];
+    [self.emptyStateView setHidden:YES];
+    [contentView addSubview:self.emptyStateView];
+
+    NSTextField *emptyTitle = [self labelWithString:@"No Connections"
+                                              frame:NSMakeRect(0.0, 0.0, 280.0, 28.0)
+                                               bold:YES];
+    [emptyTitle setAlignment:NSCenterTextAlignment];
+    [emptyTitle setFont:[NSFont boldSystemFontOfSize:20.0]];
+    [self.emptyStateView addSubview:emptyTitle];
+
+    NSTextField *emptyMessage = [self labelWithString:@"Create a new connection to get started."
+                                                frame:NSMakeRect(0.0, 0.0, 360.0, 20.0)
+                                                 bold:NO];
+    [emptyMessage setAlignment:NSCenterTextAlignment];
+    [emptyMessage setTextColor:[NSColor darkGrayColor]];
+    [emptyMessage setFont:[NSFont systemFontOfSize:13.0]];
+    [self.emptyStateView addSubview:emptyMessage];
+
+    NSTextField *emptyHint = [self labelWithString:@"File > New Connection..."
+                                             frame:NSMakeRect(0.0, 0.0, 320.0, 18.0)
+                                              bold:NO];
+    [emptyHint setAlignment:NSCenterTextAlignment];
+    [emptyHint setTextColor:[NSColor grayColor]];
+    [emptyHint setFont:[NSFont systemFontOfSize:12.0]];
+    [self.emptyStateView addSubview:emptyHint];
+
+    [self positionEmptyStateSubviews];
+
+    NSBox *statusBar = [[NSBox alloc] initWithFrame:NSMakeRect(0.0, 0.0, bounds.size.width, 34.0)];
+    [statusBar setBoxType:NSBoxCustom];
+    [statusBar setBorderType:NSNoBorder];
+    [statusBar setBorderWidth:0.0];
+    [statusBar setFillColor:[NSColor colorWithCalibratedWhite:0.95 alpha:1.0]];
+    [statusBar setAutoresizingMask:NSViewWidthSizable | NSViewMaxYMargin];
+    [contentView addSubview:statusBar];
+
+    self.statusField = [self labelWithString:@"Ready."
+                                       frame:NSMakeRect(14.0, 8.0, bounds.size.width - 160.0, 18.0)
+                                        bold:NO];
+    [self.statusField setAutoresizingMask:NSViewWidthSizable];
+    [statusBar addSubview:self.statusField];
+
+    self.countField = [self labelWithString:@"0 connections"
+                                      frame:NSMakeRect(bounds.size.width - 140.0, 8.0, 126.0, 18.0)
+                                       bold:NO];
+    [self.countField setAlignment:NSRightTextAlignment];
+    [self.countField setAutoresizingMask:NSViewMinXMargin];
+    [statusBar addSubview:self.countField];
+}
+
+- (void)positionEmptyStateSubviews
+{
+    NSArray *subviews = [self.emptyStateView subviews];
+    NSRect bounds = [self.emptyStateView bounds];
+    CGFloat centerX = floor((bounds.size.width - 360.0) / 2.0);
+    CGFloat centerY = floor((bounds.size.height - 90.0) / 2.0);
+
+    if ([subviews count] < 3) {
+        return;
+    }
+
+    [[subviews objectAtIndex:0] setFrame:NSMakeRect(centerX + 40.0, centerY + 38.0, 280.0, 28.0)];
+    [[subviews objectAtIndex:1] setFrame:NSMakeRect(centerX, centerY + 12.0, 360.0, 20.0)];
+    [[subviews objectAtIndex:2] setFrame:NSMakeRect(centerX + 20.0, centerY - 10.0, 320.0, 18.0)];
+}
+
+- (void)windowDidResize:(NSNotification *)notification
+{
+    if ([notification object] == self.window) {
+        [self positionEmptyStateSubviews];
+    }
+}
+
+- (void)windowDidBecomeKey:(NSNotification *)notification
+{
+    if ([notification object] == self.window) {
+        [self reloadBookmarkList];
+    }
+}
+
+- (void)installMainMenu
+{
+    NSString *appName = [self applicationDisplayName];
+    NSMenu *mainMenu = [[NSMenu alloc] initWithTitle:@""];
+    NSMenuItem *appRoot = [[NSMenuItem alloc] initWithTitle:appName action:NULL keyEquivalent:@""];
+    NSMenuItem *fileRoot = [[NSMenuItem alloc] initWithTitle:@"File" action:NULL keyEquivalent:@""];
+    NSMenuItem *connectionRoot = [[NSMenuItem alloc] initWithTitle:@"Actions" action:NULL keyEquivalent:@""];
+    NSMenuItem *bookmarksRoot = [[NSMenuItem alloc] initWithTitle:@"Connections" action:NULL keyEquivalent:@""];
+    NSMenuItem *windowRoot = [[NSMenuItem alloc] initWithTitle:@"Window" action:NULL keyEquivalent:@""];
+    NSMenuItem *helpRoot = [[NSMenuItem alloc] initWithTitle:@"Help" action:NULL keyEquivalent:@""];
+
+    [mainMenu addItem:appRoot];
+    [mainMenu addItem:fileRoot];
+    [mainMenu addItem:connectionRoot];
+    [mainMenu addItem:bookmarksRoot];
+    [mainMenu addItem:windowRoot];
+    [mainMenu addItem:helpRoot];
+
+    [appRoot setSubmenu:[self applicationMenuWithAppName:appName]];
+    [fileRoot setSubmenu:[self fileMenu]];
+    [connectionRoot setSubmenu:[self connectionMenu]];
+    self.bookmarksMenu = [[NSMenu alloc] initWithTitle:@"Connections"];
+    [bookmarksRoot setSubmenu:self.bookmarksMenu];
+    [windowRoot setSubmenu:[self windowMenu]];
+    [helpRoot setSubmenu:[self helpMenu]];
+
+    [NSApp setMainMenu:mainMenu];
+    [NSApp setWindowsMenu:[windowRoot submenu]];
+    [NSApp setHelpMenu:[helpRoot submenu]];
+}
+
+- (NSMenu *)applicationMenuWithAppName:(NSString *)appName
+{
+    NSMenu *menu = [[NSMenu alloc] initWithTitle:appName];
+    NSMenuItem *item = nil;
+
+    [menu addItem:[self menuItemWithTitle:[NSString stringWithFormat:@"About %@", appName]
+                                   action:@selector(showAboutPanel:)
+                              keyEquivalent:@""
+                              keyModifiers:0]];
+    [menu addItem:[NSMenuItem separatorItem]];
+    item = [self menuItemWithTitle:[NSString stringWithFormat:@"Hide %@", appName]
+                            action:@selector(hide:)
+                       keyEquivalent:@"h"
+                       keyModifiers:NSCommandKeyMask];
+    [item setTarget:nil];
+    [menu addItem:item];
+    item = [self menuItemWithTitle:@"Hide Others"
+                            action:@selector(hideOtherApplications:)
+                       keyEquivalent:@"h"
+                       keyModifiers:(NSCommandKeyMask | NSAlternateKeyMask)];
+    [item setTarget:nil];
+    [menu addItem:item];
+    item = [self menuItemWithTitle:@"Show All"
+                            action:@selector(unhideAllApplications:)
+                       keyEquivalent:@""
+                       keyModifiers:0];
+    [item setTarget:nil];
+    [menu addItem:item];
+    [menu addItem:[NSMenuItem separatorItem]];
+    item = [self menuItemWithTitle:[NSString stringWithFormat:@"Quit %@", appName]
+                            action:@selector(terminate:)
+                       keyEquivalent:@"q"
+                       keyModifiers:NSCommandKeyMask];
+    [item setTarget:nil];
+    [menu addItem:item];
+    return menu;
+}
+
+- (NSMenu *)fileMenu
+{
+    NSMenu *menu = [[NSMenu alloc] initWithTitle:@"File"];
+    [menu addItem:[self menuItemWithTitle:@"New Connection..."
+                                   action:@selector(addBookmark:)
+                              keyEquivalent:@"n"
+                              keyModifiers:NSCommandKeyMask]];
+    [menu addItem:[self menuItemWithTitle:@"Edit Connection..."
+                                   action:@selector(editBookmark:)
+                              keyEquivalent:@"e"
+                              keyModifiers:NSCommandKeyMask]];
+    [menu addItem:[self menuItemWithTitle:@"Delete Connection"
+                                   action:@selector(removeBookmark:)
+                              keyEquivalent:@""
+                              keyModifiers:0]];
+    [menu addItem:[self menuItemWithTitle:@"Duplicate Connection"
+                                   action:@selector(duplicateSelectedBookmark:)
+                              keyEquivalent:@""
+                              keyModifiers:0]];
+    [menu addItem:[NSMenuItem separatorItem]];
+    [menu addItem:[self menuItemWithTitle:@"Import Connections..."
+                                   action:@selector(importConnections:)
+                              keyEquivalent:@"i"
+                              keyModifiers:NSCommandKeyMask]];
+    [menu addItem:[self menuItemWithTitle:@"Export Connection..."
+                                   action:@selector(exportSelectedBookmark:)
+                              keyEquivalent:@""
+                              keyModifiers:0]];
+    [menu addItem:[self menuItemWithTitle:@"Export All Connections..."
+                                   action:@selector(exportAllBookmarks:)
+                              keyEquivalent:@""
+                              keyModifiers:0]];
+    [menu addItem:[NSMenuItem separatorItem]];
+    [menu addItem:[self menuItemWithTitle:@"Close"
+                                   action:@selector(closeWindow:)
+                              keyEquivalent:@"w"
+                              keyModifiers:NSCommandKeyMask]];
+    return menu;
+}
+
+- (NSMenu *)connectionMenu
+{
+    NSMenu *menu = [[NSMenu alloc] initWithTitle:@"Actions"];
+    [menu addItem:[self menuItemWithTitle:@"Connect"
+                                   action:@selector(connectSelectedBookmark:)
+                              keyEquivalent:@"r"
+                              keyModifiers:NSCommandKeyMask]];
+    [menu addItem:[self menuItemWithTitle:@"Disconnect"
+                                   action:@selector(disconnectSelectedBookmark:)
+                              keyEquivalent:@"d"
+                              keyModifiers:NSCommandKeyMask]];
+    [menu addItem:[self menuItemWithTitle:@"List Shares"
+                                   action:@selector(listShares:)
+                              keyEquivalent:@"l"
+                              keyModifiers:NSCommandKeyMask]];
+    [menu addItem:[NSMenuItem separatorItem]];
+    [menu addItem:[self menuItemWithTitle:@"Open in Finder"
+                                   action:@selector(openSelectedBookmarkInFinder:)
+                              keyEquivalent:@"o"
+                              keyModifiers:NSCommandKeyMask]];
+    [menu addItem:[self menuItemWithTitle:@"Reveal Mount Point"
+                                   action:@selector(revealSelectedMountPoint:)
+                              keyEquivalent:@""
+                              keyModifiers:0]];
+    return menu;
+}
+
+- (NSMenu *)windowMenu
+{
+    NSMenu *menu = [[NSMenu alloc] initWithTitle:@"Window"];
+    NSMenuItem *item = [self menuItemWithTitle:@"Minimize"
+                                        action:@selector(performMiniaturize:)
+                                   keyEquivalent:@"m"
+                                   keyModifiers:NSCommandKeyMask];
+    [item setTarget:nil];
+    [menu addItem:item];
+    item = [self menuItemWithTitle:@"Bring All to Front"
+                            action:@selector(arrangeInFront:)
+                       keyEquivalent:@""
+                       keyModifiers:0];
+    [item setTarget:nil];
+    [menu addItem:item];
+    return menu;
+}
+
+- (NSMenu *)helpMenu
+{
+    NSMenu *menu = [[NSMenu alloc] initWithTitle:@"Help"];
+    [menu addItem:[self menuItemWithTitle:@"SMB2 FUSE Help"
+                                   action:@selector(showHelpPanel:)
+                              keyEquivalent:@""
+                              keyModifiers:0]];
+    [menu addItem:[self menuItemWithTitle:@"Command Line Help"
+                                   action:@selector(showCommandLineHelp:)
+                              keyEquivalent:@""
+                              keyModifiers:0]];
+    return menu;
+}
+
+- (NSMenuItem *)menuItemWithTitle:(NSString *)title
+                           action:(SEL)action
+                      keyEquivalent:(NSString *)keyEquivalent
+                      keyModifiers:(NSUInteger)keyModifiers
+{
+    NSMenuItem *item = [[NSMenuItem alloc] initWithTitle:title action:action keyEquivalent:keyEquivalent ?: @""];
+    [item setTarget:self];
+    [item setKeyEquivalentModifierMask:keyModifiers];
+    return item;
+}
+
+- (NSTableColumn *)bookmarkColumn
+{
+    NSTableColumn *column = [[NSTableColumn alloc] initWithIdentifier:@"bookmark"];
+    [column setWidth:700.0];
+    return column;
+}
+
+- (NSTextField *)labelWithString:(NSString *)string frame:(NSRect)frame bold:(BOOL)bold
+{
+    NSTextField *label = [[NSTextField alloc] initWithFrame:frame];
+    [label setBordered:NO];
+    [label setEditable:NO];
+    [label setSelectable:NO];
+    [label setDrawsBackground:NO];
+    [label setStringValue:string ?: @""];
+    [label setFont:bold ? [NSFont boldSystemFontOfSize:12.0] : [NSFont systemFontOfSize:12.0]];
+    return label;
+}
+
+- (NSButton *)buttonWithTitle:(NSString *)title frame:(NSRect)frame action:(SEL)action
+{
+    NSButton *button = [[NSButton alloc] initWithFrame:frame];
+    [button setTitle:title];
+    [button setBezelStyle:NSRoundedBezelStyle];
+    [button setTarget:self];
+    [button setAction:action];
+    return button;
+}
+
+- (NSInteger)numberOfRowsInTableView:(NSTableView *)tableView
+{
+    (void)tableView;
+    return (NSInteger)[self.bookmarks count];
+}
+
+- (NSView *)tableView:(NSTableView *)tableView
+   viewForTableColumn:(NSTableColumn *)tableColumn
+                  row:(NSInteger)row
+{
+    (void)tableColumn;
+    (void)tableView;
+
+    SMBBookmarkCellView *cell = [self.bookmarksTable makeViewWithIdentifier:@"bookmark-cell" owner:self];
+    if (!cell) {
+        cell = [[SMBBookmarkCellView alloc] initWithFrame:NSMakeRect(0.0, 0.0, [self.bookmarksTable bounds].size.width, 60.0)];
+        [cell setIdentifier:@"bookmark-cell"];
+    }
+
+    NSDictionary *bookmark = [self.bookmarks objectAtIndex:(NSUInteger)row];
+    NSString *title = [self bookmarkDisplayName:bookmark];
+    NSString *server = [bookmark objectForKey:@"server"] ?: @"";
+    NSString *share = [bookmark objectForKey:@"share"] ?: @"";
+    NSString *user = [bookmark objectForKey:@"user"] ?: @"Guest";
+    NSString *domain = [bookmark objectForKey:@"domain"] ?: @"";
+    NSString *uuid = [bookmark objectForKey:@"uuid"] ?: @"";
+    NSString *mountpoint = [self.mountedBookmarkPaths objectForKey:uuid];
+    NSString *subtitle = nil;
+    NSString *detail = nil;
+    NSImage *icon = [NSImage imageNamed:NSImageNameNetwork];
+
+    if ([share length] > 0) {
+        subtitle = [NSString stringWithFormat:@"%@  •  %@", server, share];
+    } else {
+        subtitle = server;
+    }
+
+    if ([domain length] > 0) {
+        detail = [NSString stringWithFormat:@"%@  •  %@", user, domain];
+    } else {
+        detail = user;
+    }
+
+    [cell.bookmarkIconView setImage:icon];
+    [cell.titleField setStringValue:title];
+    [cell.subtitleField setStringValue:subtitle ?: @""];
+    [cell.detailField setStringValue:detail ?: @""];
+    [cell.mountedField setStringValue:[mountpoint length] > 0 ? @"Connected" : @""];
+
+    return cell;
+}
+
+- (void)tableViewSelectionDidChange:(NSNotification *)notification
+{
+    (void)notification;
+    [self refreshButtons];
+}
+
+- (IBAction)addBookmark:(id)sender
+{
+    (void)sender;
+    [self openEditorForBookmark:nil atIndex:-1];
+}
+
+- (IBAction)duplicateSelectedBookmark:(id)sender
+{
+    (void)sender;
+    NSInteger row = [self selectedBookmarkRow];
+    NSDictionary *bookmark = [self selectedBookmark];
+    NSMutableDictionary *copy = nil;
+    NSString *originalName = nil;
+    NSString *uuid = nil;
+
+    if (!bookmark) {
+        [self setStatus:@"Select a connection to duplicate."];
+        return;
+    }
+
+    copy = [bookmark mutableCopy];
+    originalName = [self bookmarkDisplayName:bookmark];
+    uuid = [copy objectForKey:@"uuid"];
+    if ([uuid length] > 0) {
+        [self.mountedBookmarkPaths removeObjectForKey:uuid];
+    }
+    [copy setObject:[self generateBookmarkUUID] forKey:@"uuid"];
+    [copy setObject:[NSString stringWithFormat:@"%@ Copy", originalName] forKey:@"name"];
+
+    [self.bookmarks insertObject:copy atIndex:(NSUInteger)(row + 1)];
+    [self persistBookmarks];
+    [self reloadBookmarkList];
+    [self.bookmarksTable selectRowIndexes:[NSIndexSet indexSetWithIndex:(NSUInteger)(row + 1)] byExtendingSelection:NO];
+    [self setStatus:@"Connection duplicated."];
+}
+
+- (IBAction)editBookmark:(id)sender
+{
+    (void)sender;
+    NSInteger row = [self selectedBookmarkRow];
+    if (row < 0) {
+        [self setStatus:@"Select a connection to edit."];
+        return;
+    }
+
+    [self openEditorForBookmark:[self.bookmarks objectAtIndex:(NSUInteger)row] atIndex:row];
+}
+
+- (IBAction)removeBookmark:(id)sender
+{
+    (void)sender;
+    NSInteger row = [self selectedBookmarkRow];
+    if (row < 0) {
+        [self setStatus:@"Select a connection to remove."];
+        return;
+    }
+
+    NSDictionary *bookmark = [self.bookmarks objectAtIndex:(NSUInteger)row];
+    NSString *uuid = [bookmark objectForKey:@"uuid"];
+    if ([uuid length] > 0) {
+        [self.mountedBookmarkPaths removeObjectForKey:uuid];
+    }
+
+    [self.bookmarks removeObjectAtIndex:(NSUInteger)row];
+    [self persistBookmarks];
+    [self reloadBookmarkList];
+    [self setStatus:@"Connection removed."];
+}
+
+- (IBAction)connectSelectedBookmark:(id)sender
+{
+    (void)sender;
+    [self refreshMountedBookmarkPathsFromSystem];
+    if (self.taskRunning) {
+        [self setStatus:@"A task is already running."];
+        return;
+    }
+
+    NSDictionary *bookmark = [self selectedBookmark];
+    if (!bookmark) {
+        [self setStatus:@"Select a connection to connect."];
+        return;
+    }
+
+    if ([self isBookmarkMounted:bookmark]) {
+        [self setStatus:@"This connection is already connected."];
+        return;
+    }
+
+    NSString *server = [bookmark objectForKey:@"server"] ?: @"";
+    NSString *share = [bookmark objectForKey:@"share"] ?: @"";
+    NSString *user = [bookmark objectForKey:@"user"] ?: @"";
+    NSString *domain = [bookmark objectForKey:@"domain"] ?: @"";
+    NSDictionary *passwordDecision = nil;
+    NSString *password = nil;
+    BOOL shouldRememberPassword = NO;
+
+    if ([server length] == 0 || [share length] == 0) {
+        [self setStatus:@"The selected connection needs both server and share."];
+        return;
+    }
+
+    if ([user length] > 0) {
+        passwordDecision = [self preparedPasswordDecisionForServer:server
+                                                              user:user
+                                                            domain:domain
+                                                             title:@"Password Required"
+                                                           message:[NSString stringWithFormat:@"Enter the password for %@ on %@.", user, server]];
+        if (!passwordDecision) {
+            [self setStatus:@"Connection cancelled."];
+            return;
+        }
+        password = [passwordDecision objectForKey:@"password"] ?: @"";
+        shouldRememberPassword = [[passwordDecision objectForKey:@"remember"] boolValue];
+    }
+
+    NSMutableArray *arguments = [NSMutableArray array];
+    [arguments addObject:@"--server"];
+    [arguments addObject:server];
+    [arguments addObject:@"--share"];
+    [arguments addObject:share];
+    [self appendOptionalFlag:@"--user" value:user toArguments:arguments];
+    [self appendOptionalFlag:@"--domain" value:domain toArguments:arguments];
+
+    if ([user length] > 0) {
+        [arguments addObject:@"--passfd"];
+        [arguments addObject:@"0"];
+    }
+
+    [self setControlsEnabled:NO];
+    [self setStatus:[NSString stringWithFormat:@"Connecting to %@...", [self bookmarkDisplayName:bookmark]]];
+    [self runCommandAtPath:[self smb2fsExecutablePath]
+                 arguments:arguments
+                  password:password
+                   purpose:SMBTaskPurposeMount
+                completion:^(int status, NSString *output) {
+        [self setControlsEnabled:YES];
+
+        if (status == 0) {
+            NSString *uuid = [bookmark objectForKey:@"uuid"];
+            NSString *mountpoint = [self mountpointFromOutput:output];
+            NSString *mountStatus = nil;
+            if ([mountpoint length] == 0) {
+                mountpoint = [self bestGuessMountpointForBookmark:bookmark];
+            }
+            if ([uuid length] > 0 && [mountpoint length] > 0) {
+                [self.mountedBookmarkPaths setObject:mountpoint forKey:uuid];
+            }
+            [self reloadBookmarkList];
+            mountStatus = [NSString stringWithFormat:@"Mounted %@%@%@.",
+                           [self bookmarkDisplayName:bookmark],
+                           [mountpoint length] > 0 ? @" at " : @"",
+                           [mountpoint length] > 0 ? mountpoint : @""];
+            if (shouldRememberPassword) {
+                OSStatus saveStatus = [self storePasswordInKeychain:password server:server user:user domain:domain];
+                if (saveStatus != errSecSuccess) {
+                    [self showTextPanelWithTitle:@"Keychain Save Failed"
+                                            text:[NSString stringWithFormat:@"The connection succeeded, but the password could not be saved in the Mac keychain.\n\n%@",
+                                                  [self securityErrorStringForStatus:saveStatus]]];
+                    mountStatus = [mountStatus stringByAppendingString:@" Password was not saved."];
+                }
+            }
+            [self setStatus:mountStatus];
+        } else {
+            [self showTextPanelWithTitle:@"Connection Failed" text:output];
+            [self setStatus:@"Connection failed."];
+        }
+    }];
+}
+
+- (IBAction)disconnectSelectedBookmark:(id)sender
+{
+    (void)sender;
+    [self refreshMountedBookmarkPathsFromSystem];
+    if (self.taskRunning) {
+        [self setStatus:@"A task is already running."];
+        return;
+    }
+
+    NSDictionary *bookmark = [self selectedBookmark];
+    if (!bookmark) {
+        [self setStatus:@"Select a connection to disconnect."];
+        return;
+    }
+
+    if (![self isBookmarkMounted:bookmark]) {
+        [self setStatus:@"This connection is not currently connected."];
+        return;
+    }
+
+    NSString *mountpoint = [self mountedPathForBookmark:bookmark];
+    if ([mountpoint length] == 0) {
+        mountpoint = [self bestGuessMountpointForBookmark:bookmark];
+    }
+    if ([mountpoint length] == 0) {
+        [self setStatus:@"This connection does not have a known mount point."];
+        return;
+    }
+
+    [self setControlsEnabled:NO];
+    [self setStatus:[NSString stringWithFormat:@"Disconnecting %@...", [self bookmarkDisplayName:bookmark]]];
+    [self runCommandAtPath:@"/sbin/umount"
+                 arguments:[NSArray arrayWithObject:mountpoint]
+                  password:nil
+                   purpose:SMBTaskPurposeUnmount
+                completion:^(int status, NSString *output) {
+        [self setControlsEnabled:YES];
+
+        if (status == 0) {
+            NSString *uuid = [bookmark objectForKey:@"uuid"];
+            if ([uuid length] > 0) {
+                [self.mountedBookmarkPaths removeObjectForKey:uuid];
+            }
+            [self reloadBookmarkList];
+            [self setStatus:@"Disconnected."];
+        } else {
+            [self showTextPanelWithTitle:@"Disconnect Failed" text:output];
+            [self setStatus:@"Disconnect failed."];
+        }
+    }];
+}
+
+- (IBAction)listShares:(id)sender
+{
+    (void)sender;
+    [self refreshMountedBookmarkPathsFromSystem];
+    if (self.taskRunning) {
+        [self setStatus:@"A task is already running."];
+        return;
+    }
+
+    NSDictionary *bookmark = [self selectedBookmark];
+    if (!bookmark) {
+        [self setStatus:@"Select a connection first."];
+        return;
+    }
+
+    NSString *server = [bookmark objectForKey:@"server"] ?: @"";
+    NSString *user = [bookmark objectForKey:@"user"] ?: @"";
+    NSString *domain = [bookmark objectForKey:@"domain"] ?: @"";
+    NSDictionary *passwordDecision = nil;
+    NSString *password = nil;
+    BOOL shouldRememberPassword = NO;
+
+    if ([server length] == 0) {
+        [self setStatus:@"The selected connection needs a server."];
+        return;
+    }
+
+    if ([user length] > 0) {
+        passwordDecision = [self preparedPasswordDecisionForServer:server
+                                                              user:user
+                                                            domain:domain
+                                                             title:@"Password Required"
+                                                           message:[NSString stringWithFormat:@"Enter the password for %@ on %@.", user, server]];
+        if (!passwordDecision) {
+            [self setStatus:@"Share listing cancelled."];
+            return;
+        }
+        password = [passwordDecision objectForKey:@"password"] ?: @"";
+        shouldRememberPassword = [[passwordDecision objectForKey:@"remember"] boolValue];
+    }
+
+    NSMutableArray *arguments = [NSMutableArray arrayWithObjects:@"--list-shares", @"--server", server, nil];
+    [self appendOptionalFlag:@"--user" value:user toArguments:arguments];
+    [self appendOptionalFlag:@"--domain" value:domain toArguments:arguments];
+
+    if ([user length] > 0) {
+        [arguments addObject:@"--passfd"];
+        [arguments addObject:@"0"];
+    }
+
+    [self setControlsEnabled:NO];
+    [self setStatus:[NSString stringWithFormat:@"Listing shares for %@...", server]];
+    [self runCommandAtPath:[self smb2fsExecutablePath]
+                 arguments:arguments
+                  password:password
+                   purpose:SMBTaskPurposeListShares
+                completion:^(int status, NSString *output) {
+        [self setControlsEnabled:YES];
+
+        if (status == 0) {
+            NSArray *shares = [self parseShareNamesFromOutput:output];
+            if (shouldRememberPassword) {
+                OSStatus saveStatus = [self storePasswordInKeychain:password server:server user:user domain:domain];
+                if (saveStatus != errSecSuccess) {
+                    [self showTextPanelWithTitle:@"Keychain Save Failed"
+                                            text:[NSString stringWithFormat:@"The share listing succeeded, but the password could not be saved in the Mac keychain.\n\n%@",
+                                                  [self securityErrorStringForStatus:saveStatus]]];
+                }
+            }
+            if ([shares count] == 0) {
+                [self showTextPanelWithTitle:@"Visible Shares" text:@"No browseable shares were returned."];
+                [self setStatus:@"No shares were returned."];
+            } else {
+                [self chooseShareFromArray:shares forBookmarkAtRow:[self selectedBookmarkRow]];
+            }
+        } else {
+            [self showTextPanelWithTitle:@"Share Listing Failed" text:output];
+            [self setStatus:@"Share listing failed."];
+        }
+    }];
+}
+
+- (IBAction)activateSelectedBookmark:(id)sender
+{
+    (void)sender;
+    [self refreshMountedBookmarkPathsFromSystem];
+
+    NSDictionary *bookmark = [self selectedBookmark];
+    if (!bookmark) {
+        [self setStatus:@"Select a connection first."];
+        return;
+    }
+
+    if ([self isBookmarkMounted:bookmark]) {
+        [self openMountedBookmarkInFinder:bookmark];
+    } else {
+        [self connectSelectedBookmark:nil];
+    }
+}
+
+- (IBAction)openSelectedBookmarkInFinder:(id)sender
+{
+    (void)sender;
+    [self refreshMountedBookmarkPathsFromSystem];
+    NSDictionary *bookmark = [self selectedBookmark];
+
+    if (!bookmark) {
+        [self setStatus:@"Select a connection first."];
+        return;
+    }
+
+    [self openMountedBookmarkInFinder:bookmark];
+}
+
+- (IBAction)revealSelectedMountPoint:(id)sender
+{
+    (void)sender;
+    [self refreshMountedBookmarkPathsFromSystem];
+    NSDictionary *bookmark = [self selectedBookmark];
+    NSString *mountpoint = nil;
+
+    if (!bookmark) {
+        [self setStatus:@"Select a connection first."];
+        return;
+    }
+
+    mountpoint = [self mountedPathForBookmark:bookmark];
+    if ([mountpoint length] == 0 || ![[NSFileManager defaultManager] fileExistsAtPath:mountpoint]) {
+        [self setStatus:@"This connection is not currently connected."];
+        return;
+    }
+
+    [[NSWorkspace sharedWorkspace] selectFile:mountpoint inFileViewerRootedAtPath:@""];
+    [self setStatus:[NSString stringWithFormat:@"Revealed %@ in Finder.", [self bookmarkDisplayName:bookmark]]];
+}
+
+- (IBAction)showAboutPanel:(id)sender
+{
+    NSPanel *panel = [[NSPanel alloc] initWithContentRect:NSMakeRect(0.0, 0.0, 420.0, 250.0)
+                                                styleMask:(NSTitledWindowMask | NSClosableWindowMask)
+                                                  backing:NSBackingStoreBuffered
+                                                    defer:NO];
+    NSView *content = [panel contentView];
+    NSImageView *iconView = [[NSImageView alloc] initWithFrame:NSMakeRect(162.0, 150.0, 96.0, 64.0)];
+    NSTextField *title = [self labelWithString:@"SMB2 FUSE"
+                                         frame:NSMakeRect(90.0, 112.0, 240.0, 28.0)
+                                          bold:YES];
+    NSTextField *subtitle = [self labelWithString:@"Lion-friendly connection manager for smb2fs"
+                                            frame:NSMakeRect(38.0, 84.0, 344.0, 20.0)
+                                             bold:NO];
+    NSTextField *author = [self labelWithString:@"Created by Gabriele Pintus"
+                                          frame:NSMakeRect(100.0, 58.0, 220.0, 18.0)
+                                           bold:NO];
+    NSTextView *linkView = [self aboutLinkViewWithFrame:NSMakeRect(40.0, 28.0, 340.0, 22.0)
+                                              urlString:@"https://github.com/GabrielePintus/smb2fuse"];
+    NSButton *okButton = [self buttonWithTitle:@"OK"
+                                         frame:NSMakeRect(170.0, 6.0, 80.0, 28.0)
+                                        action:@selector(dismissSimplePanel:)];
+
+    (void)sender;
+    [panel setTitle:@"About SMB2 FUSE"];
+    [panel center];
+    [iconView setImage:[NSApp applicationIconImage]];
+    [iconView setImageScaling:NSImageScaleProportionallyUpOrDown];
+
+    [title setAlignment:NSCenterTextAlignment];
+    [title setFont:[NSFont boldSystemFontOfSize:18.0]];
+    [subtitle setAlignment:NSCenterTextAlignment];
+    [subtitle setFont:[NSFont systemFontOfSize:13.0]];
+    [author setAlignment:NSCenterTextAlignment];
+    [author setFont:[NSFont systemFontOfSize:12.0]];
+
+    [content addSubview:iconView];
+    [content addSubview:title];
+    [content addSubview:subtitle];
+    [content addSubview:author];
+    [content addSubview:linkView];
+    [content addSubview:okButton];
+
+    [NSApp runModalForWindow:panel];
+    [panel orderOut:nil];
+}
+
+- (IBAction)showHelpPanel:(id)sender
+{
+    (void)sender;
+    [self showTextPanelWithTitle:@"SMB2 FUSE Help"
+                            text:@"SMB2 FUSE manages saved SMB connections and launches the smb2fs CLI for you.\n\nUse File > New Connection to create a saved connection, File > Import Connections to bring in JSON exports, and File > Export to share or back up your saved connections.\n\nIf a connection uses a username, you can optionally remember its password in your Mac keychain. Saved passwords are reused automatically and are never exported.\n\nUse Actions > List Shares to browse shares on a host, Actions > Connect to mount the selected connection, and Actions > Disconnect to unmount it.\n\nDouble-click an unmounted connection to connect. Double-click a mounted connection to open it in Finder."];
+}
+
+- (IBAction)showCommandLineHelp:(id)sender
+{
+    NSString *path = [self smb2fsExecutablePath];
+    NSString *output = nil;
+    int status = -1;
+
+    (void)sender;
+    output = [self outputForCommandAtPath:path arguments:[NSArray arrayWithObject:@"--help"] terminationStatus:&status];
+    if (status != 0 || [output length] == 0) {
+        output = @"Usage: smb2fs [mountpoint] --server HOST --share SHARE [--user USER]\n       [--password PASS | --passfd FD | --password-prompt]\n       [--domain DOMAIN] [--volname NAME] [FUSE options]\n\nKey options:\n  --list-shares\n  --server HOST\n  --share SHARE\n  --user USER\n  --domain DOMAIN\n  --volname NAME\n  --help";
+    }
+    [self showTextPanelWithTitle:@"Command Line Help" text:output];
+}
+
+- (IBAction)importConnections:(id)sender
+{
+    NSOpenPanel *panel = [NSOpenPanel openPanel];
+    NSData *data = nil;
+    NSError *error = nil;
+    NSDictionary *document = nil;
+    NSArray *connections = nil;
+    NSMutableArray *normalized = [NSMutableArray array];
+    NSMutableArray *issues = [NSMutableArray array];
+    NSUInteger importCount = 0;
+    NSString *summary = nil;
+
+    (void)sender;
+    if (self.taskRunning) {
+        [self setStatus:@"A task is already running."];
+        return;
+    }
+
+    [panel setCanChooseDirectories:NO];
+    [panel setAllowsMultipleSelection:NO];
+    [panel setCanChooseFiles:YES];
+    [panel setAllowedFileTypes:[NSArray arrayWithObject:@"json"]];
+
+    if ([panel runModal] != NSFileHandlingPanelOKButton) {
+        [self setStatus:@"Import cancelled."];
+        return;
+    }
+
+    data = [NSData dataWithContentsOfURL:[panel URL] options:0 error:&error];
+    if (!data) {
+        [self showTextPanelWithTitle:@"Import Failed"
+                                text:[NSString stringWithFormat:@"Could not read the selected file.\n\n%@",
+                                      [error localizedDescription] ?: @"Unknown error."]];
+        [self setStatus:@"Import failed."];
+        return;
+    }
+
+    document = [self connectionExchangeDocumentFromData:data error:&error];
+    if (!document) {
+        [self showTextPanelWithTitle:@"Import Failed"
+                                text:[NSString stringWithFormat:@"The selected file is not a valid SMB2 FUSE connections export.\n\n%@",
+                                      [error localizedDescription] ?: @"Unknown error."]];
+        [self setStatus:@"Import failed."];
+        return;
+    }
+
+    connections = [document objectForKey:@"connections"];
+    for (NSDictionary *entry in connections) {
+        NSDictionary *bookmark = [self normalizedImportedBookmarkFromDictionary:entry issues:issues];
+        if (bookmark) {
+            [normalized addObject:bookmark];
+        }
+    }
+
+    if ([normalized count] == 0) {
+        summary = [issues count] > 0
+            ? [issues componentsJoinedByString:@"\n"]
+            : @"No valid connections were found in the selected file.";
+        [self showTextPanelWithTitle:@"Nothing Imported" text:summary];
+        [self setStatus:@"No connections were imported."];
+        return;
+    }
+
+    if ([normalized count] > 1) {
+        NSInteger choice = [self importChoiceForConnectionNames:[normalized valueForKey:@"name"]];
+        if (choice == NSAlertSecondButtonReturn) {
+            NSDictionary *selected = [self chooseImportedConnectionFromArray:normalized];
+            if (!selected) {
+                [self setStatus:@"Import cancelled."];
+                return;
+            }
+            [normalized removeAllObjects];
+            [normalized addObject:selected];
+        } else if (choice != NSAlertFirstButtonReturn) {
+            [self setStatus:@"Import cancelled."];
+            return;
+        }
+    }
+
+    for (NSDictionary *bookmark in normalized) {
+        [self.bookmarks addObject:[bookmark mutableCopy]];
+    }
+    importCount = [normalized count];
+
+    [self persistBookmarks];
+    [self reloadBookmarkList];
+    if ([self.bookmarks count] > 0) {
+        NSUInteger lastIndex = [self.bookmarks count] - 1;
+        [self.bookmarksTable selectRowIndexes:[NSIndexSet indexSetWithIndex:lastIndex] byExtendingSelection:NO];
+        [self.bookmarksTable scrollRowToVisible:(NSInteger)lastIndex];
+    }
+
+    if ([issues count] > 0) {
+        NSString *title = importCount == 1 ? @"Imported 1 Connection" : [NSString stringWithFormat:@"Imported %lu Connections", (unsigned long)importCount];
+        NSString *detail = [NSString stringWithFormat:@"Some entries were skipped:\n\n%@",
+                            [issues componentsJoinedByString:@"\n"]];
+        [self showTextPanelWithTitle:title text:detail];
+    }
+
+    [self setStatus:[NSString stringWithFormat:@"Imported %lu connection%@.",
+                     (unsigned long)importCount,
+                     importCount == 1 ? @"" : @"s"]];
+}
+
+- (IBAction)exportSelectedBookmark:(id)sender
+{
+    NSDictionary *bookmark = nil;
+
+    (void)sender;
+    if (self.taskRunning) {
+        [self setStatus:@"A task is already running."];
+        return;
+    }
+
+    bookmark = [self selectedBookmark];
+    if (!bookmark) {
+        [self setStatus:@"Select a connection to export."];
+        return;
+    }
+
+    [self exportBookmarks:[NSArray arrayWithObject:bookmark]
+              defaultName:[NSString stringWithFormat:@"%@.json", [self safeFilenameForConnectionName:[self bookmarkDisplayName:bookmark]]]
+              statusLabel:@"connection"];
+}
+
+- (IBAction)exportAllBookmarks:(id)sender
+{
+    (void)sender;
+    if (self.taskRunning) {
+        [self setStatus:@"A task is already running."];
+        return;
+    }
+
+    if ([self.bookmarks count] == 0) {
+        [self setStatus:@"There are no connections to export."];
+        return;
+    }
+
+    [self exportBookmarks:self.bookmarks
+              defaultName:@"SMB2-FUSE-Connections.json"
+              statusLabel:@"connections"];
+}
+
+- (IBAction)selectBookmarkFromMenuItem:(id)sender
+{
+    NSMenuItem *item = (NSMenuItem *)sender;
+    NSString *uuid = [item representedObject];
+    NSInteger row = [self rowForBookmarkUUID:uuid];
+
+    if (row < 0) {
+        return;
+    }
+
+    [self.bookmarksTable selectRowIndexes:[NSIndexSet indexSetWithIndex:(NSUInteger)row] byExtendingSelection:NO];
+    [self.bookmarksTable scrollRowToVisible:row];
+    [self.window makeKeyAndOrderFront:nil];
+    [NSApp activateIgnoringOtherApps:YES];
+    [self refreshButtons];
+}
+
+- (IBAction)closeWindow:(id)sender
+{
+    (void)sender;
+    [self.window performClose:nil];
+}
+
+- (void)openEditorForBookmark:(NSDictionary *)bookmark atIndex:(NSInteger)index
+{
+    NSDictionary *source = bookmark ?: [NSDictionary dictionary];
+    NSPanel *panel = [[NSPanel alloc] initWithContentRect:NSMakeRect(0.0, 0.0, 390.0, 286.0)
+                                                styleMask:(NSTitledWindowMask | NSClosableWindowMask)
+                                                  backing:NSBackingStoreBuffered
+                                                    defer:NO];
+    NSView *contentView = [panel contentView];
+
+    [panel setTitle:index >= 0 ? @"Edit Connection" : @"New Connection"];
+    [panel center];
+
+    [self editorFieldInView:contentView title:@"Name" y:208.0 value:[source objectForKey:@"name"] hint:@"Office NAS" tag:kSMBEditorNameTag];
+    [self editorFieldInView:contentView title:@"Server" y:174.0 value:[source objectForKey:@"server"] hint:@"server.local or 192.168.1.52" tag:kSMBEditorServerTag];
+    [self editorFieldInView:contentView title:@"User" y:140.0 value:[source objectForKey:@"user"] hint:@"Optional username" tag:kSMBEditorUserTag];
+    [self editorShareFieldInView:contentView y:106.0 value:[source objectForKey:@"share"] hint:@"SharedFolder"];
+    [self editorFieldInView:contentView title:@"Domain" y:72.0 value:[source objectForKey:@"domain"] hint:@"Optional domain" tag:kSMBEditorDomainTag];
+
+    NSTextField *passwordState = [self labelWithString:@""
+                                                 frame:NSMakeRect(18.0, 56.0, 220.0, 16.0)
+                                                  bold:NO];
+    [passwordState setTag:kSMBEditorPasswordStateTag];
+    [passwordState setTextColor:[NSColor grayColor]];
+    [passwordState setFont:[NSFont systemFontOfSize:11.0]];
+    [contentView addSubview:passwordState];
+
+    NSButton *forgetPasswordButton = [self buttonWithTitle:@"Forget Saved Password"
+                                                     frame:NSMakeRect(242.0, 50.0, 134.0, 24.0)
+                                                    action:@selector(forgetSavedPasswordFromEditor:)];
+    [forgetPasswordButton setTag:kSMBEditorForgetPasswordTag];
+    [contentView addSubview:forgetPasswordButton];
+
+    NSTextField *errorLabel = [self labelWithString:@""
+                                              frame:NSMakeRect(18.0, 32.0, 354.0, 18.0)
+                                               bold:NO];
+    [errorLabel setTag:kSMBEditorErrorTag];
+    [errorLabel setTextColor:[NSColor colorWithCalibratedRed:0.74 green:0.14 blue:0.14 alpha:1.0]];
+    [errorLabel setFont:[NSFont boldSystemFontOfSize:11.0]];
+    [contentView addSubview:errorLabel];
+
+    NSTextField *note = [self labelWithString:@"Passwords are stored in your Mac keychain and are never exported."
+                                        frame:NSMakeRect(18.0, 16.0, 354.0, 16.0)
+                                         bold:NO];
+    [note setTextColor:[NSColor grayColor]];
+    [note setFont:[NSFont systemFontOfSize:11.0]];
+    [contentView addSubview:note];
+
+    NSButton *cancelButton = [self buttonWithTitle:@"Cancel"
+                                             frame:NSMakeRect(214.0, 4.0, 78.0, 28.0)
+                                            action:@selector(cancelEditorPanel:)];
+    NSButton *saveButton = [self buttonWithTitle:@"Save"
+                                           frame:NSMakeRect(298.0, 4.0, 78.0, 28.0)
+                                          action:@selector(saveEditorPanel:)];
+    [saveButton setKeyEquivalent:@"\r"];
+    [contentView addSubview:cancelButton];
+    [contentView addSubview:saveButton];
+
+    [[NSNotificationCenter defaultCenter] addObserver:self
+                                             selector:@selector(editorTextDidChange:)
+                                                 name:NSControlTextDidChangeNotification
+                                               object:nil];
+    [self updateEditorCredentialControlsForWindow:panel];
+
+    NSInteger response = [NSApp runModalForWindow:panel];
+    [[NSNotificationCenter defaultCenter] removeObserver:self
+                                                    name:NSControlTextDidChangeNotification
+                                                  object:nil];
+    if (response != NSAlertFirstButtonReturn) {
+        return;
+    }
+
+    NSMutableDictionary *updated = [NSMutableDictionary dictionary];
+    [self setDictionary:updated value:[self editorValueForTag:kSMBEditorNameTag inWindow:panel] forKey:@"name"];
+    [self setDictionary:updated value:[self editorValueForTag:kSMBEditorServerTag inWindow:panel] forKey:@"server"];
+    [self setDictionary:updated value:[self editorValueForTag:kSMBEditorShareTag inWindow:panel] forKey:@"share"];
+    [self setDictionary:updated value:[self editorValueForTag:kSMBEditorUserTag inWindow:panel] forKey:@"user"];
+    [self setDictionary:updated value:[self editorValueForTag:kSMBEditorDomainTag inWindow:panel] forKey:@"domain"];
+
+    if (index >= 0) {
+        NSString *uuid = [source objectForKey:@"uuid"];
+        if ([uuid length] > 0) {
+            [updated setObject:uuid forKey:@"uuid"];
+        }
+        [self.bookmarks replaceObjectAtIndex:(NSUInteger)index withObject:updated];
+    } else {
+        [updated setObject:[self generateBookmarkUUID] forKey:@"uuid"];
+        [self.bookmarks addObject:updated];
+    }
+
+    [self persistBookmarks];
+    [self reloadBookmarkList];
+    [self setStatus:index >= 0 ? @"Connection updated." : @"Connection added."];
+}
+
+- (NSTextField *)editorFieldInView:(NSView *)view
+                             title:(NSString *)title
+                                 y:(CGFloat)y
+                             value:(NSString *)value
+                              hint:(NSString *)hint
+                               tag:(NSInteger)tag
+{
+    NSTextField *label = [self labelWithString:title frame:NSMakeRect(10.0, y + 4.0, 88.0, 18.0) bold:NO];
+    [view addSubview:label];
+
+    SMBHintTextField *field = [[SMBHintTextField alloc] initWithFrame:NSMakeRect(102.0, y, 270.0, 22.0)];
+    [field setTag:tag];
+    [field setHintString:hint ?: @""];
+    [field setStringValue:value ?: @""];
+    [view addSubview:field];
+    return field;
+}
+
+- (NSTextField *)editorShareFieldInView:(NSView *)view
+                                     y:(CGFloat)y
+                                 value:(NSString *)value
+                                  hint:(NSString *)hint
+{
+    NSTextField *label = [self labelWithString:@"Share" frame:NSMakeRect(10.0, y + 4.0, 88.0, 18.0) bold:NO];
+    SMBHintTextField *field = [[SMBHintTextField alloc] initWithFrame:NSMakeRect(102.0, y, 182.0, 22.0)];
+    NSButton *button = [self buttonWithTitle:@"Browse..."
+                                       frame:NSMakeRect(292.0, y - 1.0, 80.0, 24.0)
+                                      action:@selector(browseSharesFromEditor:)];
+
+    [field setTag:kSMBEditorShareTag];
+    [field setHintString:hint ?: @""];
+    [field setStringValue:value ?: @""];
+    [button setTag:kSMBEditorBrowseSharesTag];
+
+    [view addSubview:label];
+    [view addSubview:field];
+    [view addSubview:button];
+    return field;
+}
+
+- (IBAction)browseSharesFromEditor:(id)sender
+{
+    NSWindow *window = [sender window];
+    NSTextField *serverField = (NSTextField *)[[window contentView] viewWithTag:kSMBEditorServerTag];
+    NSTextField *shareField = (NSTextField *)[[window contentView] viewWithTag:kSMBEditorShareTag];
+    NSTextField *nameField = (NSTextField *)[[window contentView] viewWithTag:kSMBEditorNameTag];
+    NSTextField *userField = (NSTextField *)[[window contentView] viewWithTag:kSMBEditorUserTag];
+    NSTextField *domainField = (NSTextField *)[[window contentView] viewWithTag:kSMBEditorDomainTag];
+    NSTextField *errorLabel = (NSTextField *)[[window contentView] viewWithTag:kSMBEditorErrorTag];
+    NSString *server = [self trimmedString:[serverField stringValue]];
+    NSString *user = [self trimmedString:[userField stringValue]];
+    NSString *domain = [self trimmedString:[domainField stringValue]];
+    NSDictionary *passwordDecision = nil;
+    NSString *password = nil;
+    BOOL shouldRememberPassword = NO;
+    NSMutableArray *arguments = nil;
+    NSString *output = nil;
+    NSArray *shares = nil;
+    int status = -1;
+
+    if ([server length] == 0) {
+        [self setEditorField:serverField invalid:YES];
+        [errorLabel setStringValue:@"Enter a server first, then browse shares."];
+        [window makeFirstResponder:serverField];
+        return;
+    }
+    if (![self isValidServerValue:server]) {
+        [self setEditorField:serverField invalid:YES];
+        [errorLabel setStringValue:@"Server must be a valid hostname or IP address."];
+        [window makeFirstResponder:serverField];
+        return;
+    }
+
+    [self setEditorField:serverField invalid:NO];
+    [errorLabel setStringValue:@""];
+
+    if ([user length] > 0) {
+        passwordDecision = [self preparedPasswordDecisionForServer:server
+                                                              user:user
+                                                            domain:domain
+                                                             title:@"Password Required"
+                                                           message:[NSString stringWithFormat:@"Enter the password for %@ on %@.", user, server]];
+        if (!passwordDecision) {
+            [errorLabel setStringValue:@"Share listing cancelled."];
+            return;
+        }
+        password = [passwordDecision objectForKey:@"password"] ?: @"";
+        shouldRememberPassword = [[passwordDecision objectForKey:@"remember"] boolValue];
+    }
+
+    arguments = [NSMutableArray arrayWithObjects:@"--list-shares", @"--server", server, nil];
+    [self appendOptionalFlag:@"--user" value:user toArguments:arguments];
+    [self appendOptionalFlag:@"--domain" value:domain toArguments:arguments];
+    if ([user length] > 0) {
+        [arguments addObject:@"--passfd"];
+        [arguments addObject:@"0"];
+    }
+
+    output = [self outputForCommandAtPath:[self smb2fsExecutablePath]
+                                arguments:arguments
+                                 password:password
+                        terminationStatus:&status];
+    if (status != 0) {
+        [self showTextPanelWithTitle:@"Share Listing Failed" text:output];
+        [errorLabel setStringValue:@"Could not list shares for that server."];
+        return;
+    }
+
+    if (shouldRememberPassword) {
+        OSStatus saveStatus = [self storePasswordInKeychain:password server:server user:user domain:domain];
+        if (saveStatus != errSecSuccess) {
+            [self showTextPanelWithTitle:@"Keychain Save Failed"
+                                    text:[NSString stringWithFormat:@"The share listing succeeded, but the password could not be saved in the Mac keychain.\n\n%@",
+                                          [self securityErrorStringForStatus:saveStatus]]];
+        }
+    }
+
+    shares = [self parseShareNamesFromOutput:output];
+    if ([shares count] == 0) {
+        [self showTextPanelWithTitle:@"Visible Shares" text:@"No browseable shares were returned."];
+        [errorLabel setStringValue:@"No browseable shares were returned."];
+        return;
+    }
+
+    if (![self chooseShareFromArray:shares intoField:shareField nameField:nameField]) {
+        [errorLabel setStringValue:@"Share selection cancelled."];
+        return;
+    }
+
+    [self setEditorField:shareField invalid:NO];
+    [errorLabel setStringValue:@""];
+    [self updateEditorCredentialControlsForWindow:window];
+}
+
+- (IBAction)saveEditorPanel:(id)sender
+{
+    NSWindow *window = [sender window];
+
+    if (![self validateEditorWindow:window]) {
+        return;
+    }
+
+    [NSApp stopModalWithCode:NSAlertFirstButtonReturn];
+    [window orderOut:nil];
+}
+
+- (IBAction)cancelEditorPanel:(id)sender
+{
+    NSWindow *window = [sender window];
+    [NSApp stopModalWithCode:NSAlertSecondButtonReturn];
+    [window orderOut:nil];
+}
+
+- (IBAction)dismissSimplePanel:(id)sender
+{
+    NSWindow *window = [sender window];
+    [NSApp stopModal];
+    [window orderOut:nil];
+}
+
+- (IBAction)confirmSimplePanel:(id)sender
+{
+    NSWindow *window = [sender window];
+    [NSApp stopModalWithCode:NSAlertFirstButtonReturn];
+    [window orderOut:nil];
+}
+
+- (IBAction)forgetSavedPasswordFromEditor:(id)sender
+{
+    NSWindow *window = [sender window];
+    NSTextField *serverField = (NSTextField *)[[window contentView] viewWithTag:kSMBEditorServerTag];
+    NSTextField *userField = (NSTextField *)[[window contentView] viewWithTag:kSMBEditorUserTag];
+    NSTextField *domainField = (NSTextField *)[[window contentView] viewWithTag:kSMBEditorDomainTag];
+    NSTextField *errorLabel = (NSTextField *)[[window contentView] viewWithTag:kSMBEditorErrorTag];
+    NSString *server = [self trimmedString:[serverField stringValue]];
+    NSString *user = [self trimmedString:[userField stringValue]];
+    NSString *domain = [self trimmedString:[domainField stringValue]];
+    OSStatus status = noErr;
+
+    if ([server length] == 0 || [user length] == 0) {
+        [self updateEditorCredentialControlsForWindow:window];
+        return;
+    }
+
+    status = [self deletePasswordFromKeychainForServer:server user:user domain:domain];
+    if (status != errSecSuccess && status != errSecItemNotFound) {
+        [errorLabel setStringValue:[NSString stringWithFormat:@"Could not remove the saved password: %@",
+                                    [self securityErrorStringForStatus:status]]];
+        return;
+    }
+
+    [errorLabel setStringValue:@""];
+    [self updateEditorCredentialControlsForWindow:window];
+}
+
+- (void)editorTextDidChange:(NSNotification *)notification
+{
+    id object = [notification object];
+    NSWindow *window = nil;
+
+    if (![object isKindOfClass:[NSControl class]]) {
+        return;
+    }
+
+    window = [(NSControl *)object window];
+    if (![window isKindOfClass:[NSPanel class]]) {
+        return;
+    }
+
+    if ([[window contentView] viewWithTag:kSMBEditorServerTag] == nil) {
+        return;
+    }
+
+    [self updateEditorCredentialControlsForWindow:window];
+}
+
+- (void)updateEditorCredentialControlsForWindow:(NSWindow *)window
+{
+    NSTextField *serverField = (NSTextField *)[[window contentView] viewWithTag:kSMBEditorServerTag];
+    NSTextField *userField = (NSTextField *)[[window contentView] viewWithTag:kSMBEditorUserTag];
+    NSTextField *domainField = (NSTextField *)[[window contentView] viewWithTag:kSMBEditorDomainTag];
+    NSTextField *stateLabel = (NSTextField *)[[window contentView] viewWithTag:kSMBEditorPasswordStateTag];
+    NSButton *forgetButton = (NSButton *)[[window contentView] viewWithTag:kSMBEditorForgetPasswordTag];
+    NSString *server = [self trimmedString:[serverField stringValue]];
+    NSString *user = [self trimmedString:[userField stringValue]];
+    NSString *domain = [self trimmedString:[domainField stringValue]];
+    BOOL validIdentity = ([server length] > 0 &&
+                          [user length] > 0 &&
+                          [self isValidServerValue:server]);
+    BOOL hasSavedPassword = NO;
+
+    if (validIdentity) {
+        hasSavedPassword = [self hasKeychainPasswordForServer:server user:user domain:domain];
+    }
+
+    [forgetButton setEnabled:hasSavedPassword];
+    if (hasSavedPassword) {
+        [stateLabel setStringValue:@"Password saved in Keychain"];
+    } else {
+        [stateLabel setStringValue:@""];
+    }
+}
+
+- (BOOL)validateEditorWindow:(NSWindow *)window
+{
+    NSTextField *serverField = (NSTextField *)[[window contentView] viewWithTag:kSMBEditorServerTag];
+    NSTextField *shareField = (NSTextField *)[[window contentView] viewWithTag:kSMBEditorShareTag];
+    NSTextField *errorLabel = (NSTextField *)[[window contentView] viewWithTag:kSMBEditorErrorTag];
+    BOOL serverMissing = ([[self trimmedString:[serverField stringValue]] length] == 0);
+    BOOL shareMissing = ([[self trimmedString:[shareField stringValue]] length] == 0);
+    BOOL serverInvalid = NO;
+
+    if (!serverMissing) {
+        serverInvalid = ![self isValidServerValue:[self trimmedString:[serverField stringValue]]];
+    }
+
+    [self setEditorField:serverField invalid:(serverMissing || serverInvalid)];
+    [self setEditorField:shareField invalid:shareMissing];
+
+    if (!serverMissing && !shareMissing && !serverInvalid) {
+        [errorLabel setStringValue:@""];
+        return YES;
+    }
+
+    if (serverMissing && shareMissing) {
+        [errorLabel setStringValue:@"Please fill in Server and Share."];
+    } else if (serverInvalid) {
+        [errorLabel setStringValue:@"Server must be a valid hostname or IP address."];
+    } else if (serverMissing) {
+        [errorLabel setStringValue:@"Please fill in Server."];
+    } else {
+        [errorLabel setStringValue:@"Please fill in Share."];
+    }
+
+    if (serverMissing || serverInvalid) {
+        [window makeFirstResponder:serverField];
+    } else {
+        [window makeFirstResponder:shareField];
+    }
+
+    return NO;
+}
+
+- (void)setEditorField:(NSTextField *)field invalid:(BOOL)invalid
+{
+    [field setDrawsBackground:YES];
+    [field setBackgroundColor:(invalid
+                               ? [NSColor colorWithCalibratedRed:1.0 green:0.90 blue:0.90 alpha:1.0]
+                               : [NSColor whiteColor])];
+}
+
+- (BOOL)isValidServerValue:(NSString *)value
+{
+    struct in_addr ipv4;
+    struct in6_addr ipv6;
+    NSArray *labels = nil;
+    BOOL numericDotsOnly = NO;
+    BOOL hasColon = NO;
+
+    if ([value length] == 0 || [value length] > 253) {
+        return NO;
+    }
+    if (inet_pton(AF_INET, [value UTF8String], &ipv4) == 1 ||
+        inet_pton(AF_INET6, [value UTF8String], &ipv6) == 1) {
+        return YES;
+    }
+
+    hasColon = ([value rangeOfString:@":"].location != NSNotFound);
+    if (hasColon) {
+        return NO;
+    }
+
+    numericDotsOnly = [self smb_stringContainsOnlyDigitsAndDots:value];
+    if (numericDotsOnly) {
+        return NO;
+    }
+
+    if ([value hasPrefix:@"."] || [value hasSuffix:@"."]) {
+        return NO;
+    }
+
+    labels = [value componentsSeparatedByString:@"."];
+    if ([labels count] == 0) {
+        return NO;
+    }
+
+    for (NSString *label in labels) {
+        NSUInteger i = 0;
+        unichar c = 0;
+
+        if ([label length] == 0 || [label length] > 63) {
+            return NO;
+        }
+        if ([label hasPrefix:@"-"] || [label hasSuffix:@"-"]) {
+            return NO;
+        }
+
+        for (i = 0; i < [label length]; i++) {
+            c = [label characterAtIndex:i];
+            if (!((c >= 'a' && c <= 'z') ||
+                  (c >= 'A' && c <= 'Z') ||
+                  (c >= '0' && c <= '9') ||
+                  c == '-')) {
+                return NO;
+            }
+        }
+    }
+
+    return YES;
+}
+
+- (BOOL)smb_stringIsNumeric:(NSString *)value
+{
+    NSUInteger i = 0;
+    unichar c = 0;
+
+    if ([value length] == 0) {
+        return NO;
+    }
+
+    for (i = 0; i < [value length]; i++) {
+        c = [value characterAtIndex:i];
+        if (!(c >= '0' && c <= '9')) {
+            return NO;
+        }
+    }
+
+    return YES;
+}
+
+- (BOOL)smb_stringContainsOnlyDigitsAndDots:(NSString *)value
+{
+    NSUInteger i = 0;
+    unichar c = 0;
+
+    if ([value length] == 0) {
+        return NO;
+    }
+
+    for (i = 0; i < [value length]; i++) {
+        c = [value characterAtIndex:i];
+        if (!((c >= '0' && c <= '9') || c == '.')) {
+            return NO;
+        }
+    }
+
+    return YES;
+}
+
+- (NSString *)editorValueForTag:(NSInteger)tag inWindow:(NSWindow *)window
+{
+    NSTextField *field = (NSTextField *)[[window contentView] viewWithTag:tag];
+    return [self trimmedString:[field stringValue]];
+}
+
+- (BOOL)chooseShareFromArray:(NSArray *)shares intoField:(NSTextField *)shareField nameField:(NSTextField *)nameField
+{
+    NSPopUpButton *popup = [[NSPopUpButton alloc] initWithFrame:NSMakeRect(0.0, 0.0, 280.0, 26.0) pullsDown:NO];
+    NSString *currentShare = [self trimmedString:[shareField stringValue]];
+    NSString *currentName = [self trimmedString:[nameField stringValue]];
+    NSString *selectedShare = nil;
+
+    [popup addItemsWithTitles:shares];
+
+    if ([currentShare length] > 0 && [shares containsObject:currentShare]) {
+        [popup selectItemWithTitle:currentShare];
+    }
+
+    NSAlert *alert = [[NSAlert alloc] init];
+    [alert setMessageText:@"Choose Share"];
+    [alert setInformativeText:@"Select a share to use for this connection."];
+    [alert setAccessoryView:popup];
+    [alert addButtonWithTitle:@"Use Share"];
+    [alert addButtonWithTitle:@"Cancel"];
+
+    if ([alert runModal] != NSAlertFirstButtonReturn) {
+        return NO;
+    }
+
+    selectedShare = [[popup selectedItem] title];
+    [shareField setStringValue:selectedShare ?: @""];
+    [shareField setNeedsDisplay:YES];
+
+    if ([currentName length] == 0 || ([currentShare length] > 0 && [currentName isEqualToString:currentShare])) {
+        [nameField setStringValue:selectedShare ?: @""];
+        [nameField setNeedsDisplay:YES];
+    }
+
+    return YES;
+}
+
+- (void)chooseShareFromArray:(NSArray *)shares forBookmarkAtRow:(NSInteger)row
+{
+    if (row < 0 || row >= (NSInteger)[self.bookmarks count]) {
+        return;
+    }
+
+    NSDictionary *bookmark = [self.bookmarks objectAtIndex:(NSUInteger)row];
+    NSTextField *shareField = [[NSTextField alloc] initWithFrame:NSZeroRect];
+    NSTextField *nameField = [[NSTextField alloc] initWithFrame:NSZeroRect];
+    NSMutableDictionary *updated = nil;
+
+    [shareField setStringValue:[bookmark objectForKey:@"share"] ?: @""];
+    [nameField setStringValue:[bookmark objectForKey:@"name"] ?: @""];
+
+    if (![self chooseShareFromArray:shares intoField:shareField nameField:nameField]) {
+        [self setStatus:@"Share selection cancelled."];
+        return;
+    }
+
+    updated = [[self.bookmarks objectAtIndex:(NSUInteger)row] mutableCopy];
+    [updated setObject:[self trimmedString:[shareField stringValue]] forKey:@"share"];
+    [self setDictionary:updated value:[self trimmedString:[nameField stringValue]] forKey:@"name"];
+    [self.bookmarks replaceObjectAtIndex:(NSUInteger)row withObject:updated];
+    [self persistBookmarks];
+    [self reloadBookmarkList];
+    [self setStatus:[NSString stringWithFormat:@"Selected share '%@'.", [shareField stringValue]]];
+}
+
+- (void)showTextPanelWithTitle:(NSString *)title text:(NSString *)text
+{
+    NSScrollView *scrollView = [[NSScrollView alloc] initWithFrame:NSMakeRect(0.0, 0.0, 420.0, 220.0)];
+    [scrollView setBorderType:NSBezelBorder];
+    [scrollView setHasVerticalScroller:YES];
+
+    NSTextView *textView = [[NSTextView alloc] initWithFrame:NSMakeRect(0.0, 0.0, 420.0, 220.0)];
+    [textView setEditable:NO];
+    [textView setString:text ?: @""];
+    [textView setFont:[NSFont fontWithName:@"Menlo" size:11.0] ?: [NSFont userFixedPitchFontOfSize:11.0]];
+    [scrollView setDocumentView:textView];
+
+    NSAlert *alert = [[NSAlert alloc] init];
+    [alert setMessageText:title ?: @"Details"];
+    [alert setAccessoryView:scrollView];
+    [alert addButtonWithTitle:@"OK"];
+    [alert runModal];
+}
+
+- (NSTextView *)aboutLinkViewWithFrame:(NSRect)frame urlString:(NSString *)urlString
+{
+    NSTextView *textView = [[NSTextView alloc] initWithFrame:frame];
+    NSMutableAttributedString *attr = [[NSMutableAttributedString alloc] initWithString:urlString ?: @""];
+    NSRange range = NSMakeRange(0, [attr length]);
+
+    [attr addAttribute:NSFontAttributeName value:[NSFont systemFontOfSize:12.0] range:range];
+    [attr addAttribute:NSForegroundColorAttributeName value:[NSColor blueColor] range:range];
+    [attr addAttribute:NSUnderlineStyleAttributeName value:[NSNumber numberWithInt:NSUnderlineStyleSingle] range:range];
+    [attr addAttribute:NSLinkAttributeName value:(urlString ?: @"") range:range];
+
+    [textView setEditable:NO];
+    [textView setSelectable:YES];
+    [textView setRichText:YES];
+    [textView setDrawsBackground:NO];
+    [textView setAlignment:NSCenterTextAlignment];
+    [textView setHorizontallyResizable:NO];
+    [textView setVerticallyResizable:NO];
+    [[textView textContainer] setContainerSize:NSMakeSize(frame.size.width, frame.size.height)];
+    [[textView textContainer] setWidthTracksTextView:YES];
+    [[textView layoutManager] ensureLayoutForTextContainer:[textView textContainer]];
+    [[textView textStorage] setAttributedString:attr];
+    return textView;
+}
+
+- (NSDictionary *)connectionExchangeDocumentFromData:(NSData *)data error:(NSError **)error
+{
+    id json = [NSJSONSerialization JSONObjectWithData:data options:0 error:error];
+    NSDictionary *document = nil;
+    id format = nil;
+    id version = nil;
+    id connections = nil;
+
+    if (![json isKindOfClass:[NSDictionary class]]) {
+        if (error) {
+            *error = [NSError errorWithDomain:@"SMB2FUSEGUI"
+                                         code:1001
+                                     userInfo:[NSDictionary dictionaryWithObject:@"The file must contain a JSON object at the top level."
+                                                                          forKey:NSLocalizedDescriptionKey]];
+        }
+        return nil;
+    }
+
+    document = (NSDictionary *)json;
+    format = [document objectForKey:@"format"];
+    version = [document objectForKey:@"version"];
+    connections = [document objectForKey:@"connections"];
+
+    if (![format isKindOfClass:[NSString class]] || ![(NSString *)format isEqualToString:kSMBConnectionExchangeFormat]) {
+        if (error) {
+            *error = [NSError errorWithDomain:@"SMB2FUSEGUI"
+                                         code:1002
+                                     userInfo:[NSDictionary dictionaryWithObject:@"This file does not look like an SMB2 FUSE connections export."
+                                                                          forKey:NSLocalizedDescriptionKey]];
+        }
+        return nil;
+    }
+    if (![version respondsToSelector:@selector(integerValue)] || [version integerValue] != kSMBConnectionExchangeVersion) {
+        if (error) {
+            *error = [NSError errorWithDomain:@"SMB2FUSEGUI"
+                                         code:1003
+                                     userInfo:[NSDictionary dictionaryWithObject:@"This connections export version is not supported."
+                                                                          forKey:NSLocalizedDescriptionKey]];
+        }
+        return nil;
+    }
+    if (![connections isKindOfClass:[NSArray class]]) {
+        if (error) {
+            *error = [NSError errorWithDomain:@"SMB2FUSEGUI"
+                                         code:1004
+                                     userInfo:[NSDictionary dictionaryWithObject:@"The file does not contain a valid connections list."
+                                                                          forKey:NSLocalizedDescriptionKey]];
+        }
+        return nil;
+    }
+
+    return document;
+}
+
+- (NSDictionary *)normalizedImportedBookmarkFromDictionary:(NSDictionary *)dictionary issues:(NSMutableArray *)issues
+{
+    NSMutableDictionary *bookmark = [NSMutableDictionary dictionary];
+    NSString *name = nil;
+    NSString *server = nil;
+    NSString *share = nil;
+    NSString *user = nil;
+    NSString *domain = nil;
+    NSString *label = nil;
+
+    if (![dictionary isKindOfClass:[NSDictionary class]]) {
+        [issues addObject:@"Skipped one entry because it was not a JSON object."];
+        return nil;
+    }
+
+    name = [self trimmedStringFromObject:[dictionary objectForKey:@"name"]];
+    server = [self trimmedStringFromObject:[dictionary objectForKey:@"server"]];
+    share = [self trimmedStringFromObject:[dictionary objectForKey:@"share"]];
+    user = [self trimmedStringFromObject:[dictionary objectForKey:@"user"]];
+    domain = [self trimmedStringFromObject:[dictionary objectForKey:@"domain"]];
+    label = [name length] > 0 ? name : ([share length] > 0 ? share : @"Unnamed connection");
+
+    if ([server length] == 0 || [share length] == 0) {
+        [issues addObject:[NSString stringWithFormat:@"Skipped '%@' because Server and Share are required.", label]];
+        return nil;
+    }
+    if (![self isValidServerValue:server]) {
+        [issues addObject:[NSString stringWithFormat:@"Skipped '%@' because '%@' is not a valid server.", label, server]];
+        return nil;
+    }
+
+    [bookmark setObject:[self generateBookmarkUUID] forKey:@"uuid"];
+    [self setDictionary:bookmark value:name forKey:@"name"];
+    [self setDictionary:bookmark value:server forKey:@"server"];
+    [self setDictionary:bookmark value:share forKey:@"share"];
+    [self setDictionary:bookmark value:user forKey:@"user"];
+    [self setDictionary:bookmark value:domain forKey:@"domain"];
+    return bookmark;
+}
+
+- (NSInteger)importChoiceForConnectionNames:(NSArray *)names
+{
+    NSAlert *alert = [[NSAlert alloc] init];
+    NSString *summary = nil;
+
+    if ([names count] == 2) {
+        summary = [NSString stringWithFormat:@"This file contains %lu connections. You can import both, or choose just one.",
+                   (unsigned long)[names count]];
+    } else {
+        summary = [NSString stringWithFormat:@"This file contains %lu connections. You can import all of them, or choose a single one.",
+                   (unsigned long)[names count]];
+    }
+
+    [alert setMessageText:@"Import Connections"];
+    [alert setInformativeText:summary];
+    [alert addButtonWithTitle:@"Import All"];
+    [alert addButtonWithTitle:@"Choose One"];
+    [alert addButtonWithTitle:@"Cancel"];
+    return [alert runModal];
+}
+
+- (NSDictionary *)chooseImportedConnectionFromArray:(NSArray *)connections
+{
+    NSPopUpButton *popup = [[NSPopUpButton alloc] initWithFrame:NSMakeRect(0.0, 0.0, 320.0, 26.0) pullsDown:NO];
+    NSAlert *alert = [[NSAlert alloc] init];
+    NSUInteger i = 0;
+
+    for (i = 0; i < [connections count]; i++) {
+        NSDictionary *bookmark = [connections objectAtIndex:i];
+        NSString *title = [self bookmarkDisplayName:bookmark];
+        NSString *server = [bookmark objectForKey:@"server"] ?: @"";
+        if ([server length] > 0) {
+            title = [NSString stringWithFormat:@"%@ (%@)", title, server];
+        }
+        [popup addItemWithTitle:title];
+    }
+
+    [alert setMessageText:@"Choose Connection"];
+    [alert setInformativeText:@"Select which connection you want to import from this file."];
+    [alert setAccessoryView:popup];
+    [alert addButtonWithTitle:@"Import"];
+    [alert addButtonWithTitle:@"Cancel"];
+
+    if ([alert runModal] != NSAlertFirstButtonReturn) {
+        return nil;
+    }
+
+    if ([popup indexOfSelectedItem] < 0 || [popup indexOfSelectedItem] >= (NSInteger)[connections count]) {
+        return nil;
+    }
+
+    return [connections objectAtIndex:(NSUInteger)[popup indexOfSelectedItem]];
+}
+
+- (void)exportBookmarks:(NSArray *)bookmarks defaultName:(NSString *)defaultName statusLabel:(NSString *)statusLabel
+{
+    NSSavePanel *panel = [NSSavePanel savePanel];
+    NSDictionary *document = [self exportDocumentForBookmarks:bookmarks];
+    NSData *data = nil;
+    NSError *error = nil;
+    NSString *path = nil;
+
+    [panel setAllowedFileTypes:[NSArray arrayWithObject:@"json"]];
+    [panel setCanCreateDirectories:YES];
+    [panel setNameFieldStringValue:defaultName ?: @"Connections.json"];
+
+    if ([panel runModal] != NSFileHandlingPanelOKButton) {
+        [self setStatus:@"Export cancelled."];
+        return;
+    }
+
+    data = [NSJSONSerialization dataWithJSONObject:document options:NSJSONWritingPrettyPrinted error:&error];
+    if (!data) {
+        [self showTextPanelWithTitle:@"Export Failed"
+                                text:[NSString stringWithFormat:@"Could not prepare the export data.\n\n%@",
+                                      [error localizedDescription] ?: @"Unknown error."]];
+        [self setStatus:@"Export failed."];
+        return;
+    }
+
+    path = [[[panel URL] path] copy];
+    if ([[path pathExtension] length] == 0) {
+        path = [path stringByAppendingPathExtension:@"json"];
+    }
+
+    if (![data writeToFile:path options:NSDataWritingAtomic error:&error]) {
+        [self showTextPanelWithTitle:@"Export Failed"
+                                text:[NSString stringWithFormat:@"Could not write the export file.\n\n%@",
+                                      [error localizedDescription] ?: @"Unknown error."]];
+        [self setStatus:@"Export failed."];
+        return;
+    }
+
+    (void)statusLabel;
+    [self setStatus:[NSString stringWithFormat:@"Exported %lu connection%@.",
+                     (unsigned long)[bookmarks count],
+                     [bookmarks count] == 1 ? @"" : @"s"]];
+}
+
+- (NSDictionary *)exportDocumentForBookmarks:(NSArray *)bookmarks
+{
+    NSMutableArray *connections = [NSMutableArray array];
+
+    for (NSDictionary *bookmark in bookmarks) {
+        [connections addObject:[self exportRepresentationForBookmark:bookmark]];
+    }
+
+    return [NSDictionary dictionaryWithObjectsAndKeys:
+            kSMBConnectionExchangeFormat, @"format",
+            [NSNumber numberWithInteger:kSMBConnectionExchangeVersion], @"version",
+            connections, @"connections",
+            nil];
+}
+
+- (NSDictionary *)exportRepresentationForBookmark:(NSDictionary *)bookmark
+{
+    NSMutableDictionary *connection = [NSMutableDictionary dictionary];
+    [self setDictionary:connection value:[self trimmedStringFromObject:[bookmark objectForKey:@"name"]] forKey:@"name"];
+    [self setDictionary:connection value:[self trimmedStringFromObject:[bookmark objectForKey:@"server"]] forKey:@"server"];
+    [self setDictionary:connection value:[self trimmedStringFromObject:[bookmark objectForKey:@"share"]] forKey:@"share"];
+    [self setDictionary:connection value:[self trimmedStringFromObject:[bookmark objectForKey:@"user"]] forKey:@"user"];
+    [self setDictionary:connection value:[self trimmedStringFromObject:[bookmark objectForKey:@"domain"]] forKey:@"domain"];
+    return connection;
+}
+
+- (void)runCommandAtPath:(NSString *)path
+               arguments:(NSArray *)arguments
+                password:(NSString *)password
+                 purpose:(SMBTaskPurpose)purpose
+              completion:(void (^)(int status, NSString *output))completion
+{
+    if ([path length] == 0) {
+        [self setStatus:@"Unable to locate smb2fs. Build the CLI first, then rebuild the app."];
+        if (completion) {
+            completion(-1, @"");
+        }
+        return;
+    }
+
+    self.taskRunning = YES;
+
+    dispatch_async(dispatch_get_global_queue(DISPATCH_QUEUE_PRIORITY_DEFAULT, 0), ^{
+        NSTask *task = [[NSTask alloc] init];
+        NSPipe *combinedPipe = [NSPipe pipe];
+        NSPipe *inputPipe = nil;
+        int status = -1;
+        NSString *output = @"";
+
+        [task setLaunchPath:path];
+        [task setArguments:arguments];
+        [task setStandardOutput:combinedPipe];
+        [task setStandardError:combinedPipe];
+
+        if (password != nil) {
+            inputPipe = [NSPipe pipe];
+            [task setStandardInput:inputPipe];
+        }
+
+        @try {
+            [task launch];
+
+            if (inputPipe) {
+                NSData *data = [password dataUsingEncoding:NSUTF8StringEncoding];
+                [[inputPipe fileHandleForWriting] writeData:data];
+                [[inputPipe fileHandleForWriting] closeFile];
+            }
+
+            output = [self readOutputFromPipe:combinedPipe];
+            [task waitUntilExit];
+            status = [task terminationStatus];
+        }
+        @catch (NSException *exception) {
+            output = [NSString stringWithFormat:@"Failed to launch task: %@\n", [exception reason]];
+        }
+
+        dispatch_async(dispatch_get_main_queue(), ^{
+            self.taskRunning = NO;
+            if (purpose == SMBTaskPurposeListShares && status != 0) {
+                [self setStatus:@"Share listing failed."];
+            }
+            if (completion) {
+                completion(status, output ?: @"");
+            }
+        });
+    });
+}
+
+- (NSString *)readOutputFromPipe:(NSPipe *)pipe
+{
+    NSData *data = [[pipe fileHandleForReading] readDataToEndOfFile];
+    if ([data length] == 0) {
+        return @"";
+    }
+
+    NSString *text = [[NSString alloc] initWithData:data encoding:NSUTF8StringEncoding];
+    if (!text) {
+        return @"<non-UTF8 output>\n";
+    }
+    return text;
+}
+
+- (NSDictionary *)preparedPasswordDecisionForServer:(NSString *)server
+                                               user:(NSString *)user
+                                             domain:(NSString *)domain
+                                              title:(NSString *)title
+                                            message:(NSString *)message
+{
+    BOOL foundInKeychain = NO;
+    NSString *savedPassword = nil;
+    NSPanel *panel = nil;
+    NSView *content = nil;
+    NSTextField *messageLabel = nil;
+    NSSecureTextField *passwordField = nil;
+    NSButton *rememberCheckbox = nil;
+    NSButton *cancelButton = nil;
+    NSButton *continueButton = nil;
+    NSInteger response = NSAlertSecondButtonReturn;
+
+    if ([user length] == 0) {
+        return [NSDictionary dictionaryWithObjectsAndKeys:
+                @"", @"password",
+                [NSNumber numberWithBool:NO], @"remember",
+                nil];
+    }
+
+    savedPassword = [self keychainPasswordForServer:server
+                                               user:user
+                                             domain:domain
+                                              found:&foundInKeychain];
+    if (foundInKeychain) {
+        return [NSDictionary dictionaryWithObjectsAndKeys:
+                savedPassword ?: @"", @"password",
+                [NSNumber numberWithBool:NO], @"remember",
+                nil];
+    }
+
+    panel = [[NSPanel alloc] initWithContentRect:NSMakeRect(0.0, 0.0, 360.0, 158.0)
+                                       styleMask:(NSTitledWindowMask | NSClosableWindowMask)
+                                         backing:NSBackingStoreBuffered
+                                           defer:NO];
+    content = [panel contentView];
+    [panel setTitle:title ?: @"Password Required"];
+    [panel center];
+
+    messageLabel = [self labelWithString:message ?: @"Enter the password."
+                                   frame:NSMakeRect(18.0, 108.0, 324.0, 36.0)
+                                    bold:NO];
+    [messageLabel setFont:[NSFont systemFontOfSize:12.0]];
+    [messageLabel setAlignment:NSLeftTextAlignment];
+    [[messageLabel cell] setWraps:YES];
+    [[messageLabel cell] setLineBreakMode:NSLineBreakByWordWrapping];
+    [content addSubview:messageLabel];
+
+    passwordField = [[NSSecureTextField alloc] initWithFrame:NSMakeRect(18.0, 76.0, 324.0, 24.0)];
+    [content addSubview:passwordField];
+
+    rememberCheckbox = [[NSButton alloc] initWithFrame:NSMakeRect(18.0, 46.0, 220.0, 18.0)];
+    [rememberCheckbox setButtonType:NSSwitchButton];
+    [rememberCheckbox setTitle:@"Remember password in Keychain"];
+    [rememberCheckbox setState:NSOffState];
+    [content addSubview:rememberCheckbox];
+
+    cancelButton = [self buttonWithTitle:@"Cancel"
+                                   frame:NSMakeRect(186.0, 10.0, 78.0, 28.0)
+                                  action:@selector(cancelEditorPanel:)];
+    continueButton = [self buttonWithTitle:@"Continue"
+                                     frame:NSMakeRect(270.0, 10.0, 78.0, 28.0)
+                                    action:@selector(confirmSimplePanel:)];
+    [continueButton setKeyEquivalent:@"\r"];
+    [content addSubview:cancelButton];
+    [content addSubview:continueButton];
+
+    [panel setInitialFirstResponder:passwordField];
+    response = [NSApp runModalForWindow:panel];
+    if (response != NSAlertFirstButtonReturn) {
+        return nil;
+    }
+
+    return [NSDictionary dictionaryWithObjectsAndKeys:
+            [passwordField stringValue] ?: @"", @"password",
+            [NSNumber numberWithBool:([rememberCheckbox state] == NSOnState)], @"remember",
+            nil];
+}
+
+- (NSString *)keychainPasswordForServer:(NSString *)server
+                                   user:(NSString *)user
+                                 domain:(NSString *)domain
+                                  found:(BOOL *)found
+{
+    UInt32 passwordLength = 0;
+    void *passwordData = NULL;
+    SecKeychainItemRef itemRef = NULL;
+    OSStatus status = SecKeychainFindInternetPassword(NULL,
+                                                      (UInt32)[server lengthOfBytesUsingEncoding:NSUTF8StringEncoding],
+                                                      [server UTF8String],
+                                                      (UInt32)[domain lengthOfBytesUsingEncoding:NSUTF8StringEncoding],
+                                                      [domain length] > 0 ? [domain UTF8String] : NULL,
+                                                      (UInt32)[user lengthOfBytesUsingEncoding:NSUTF8StringEncoding],
+                                                      [user UTF8String],
+                                                      0,
+                                                      NULL,
+                                                      0,
+                                                      kSecProtocolTypeSMB,
+                                                      kSecAuthenticationTypeDefault,
+                                                      &passwordLength,
+                                                      &passwordData,
+                                                      &itemRef);
+    NSString *password = nil;
+
+    if (found) {
+        *found = (status == errSecSuccess);
+    }
+    if (status != errSecSuccess) {
+        if (itemRef != NULL) {
+            CFRelease(itemRef);
+        }
+        return nil;
+    }
+
+    if (passwordLength == 0) {
+        password = @"";
+    } else {
+        password = [[NSString alloc] initWithBytes:passwordData
+                                            length:passwordLength
+                                          encoding:NSUTF8StringEncoding];
+        if (!password) {
+            password = [[NSString alloc] initWithData:[NSData dataWithBytes:passwordData length:passwordLength]
+                                             encoding:NSISOLatin1StringEncoding];
+        }
+    }
+
+    if (passwordData != NULL) {
+        SecKeychainItemFreeContent(NULL, passwordData);
+    }
+    if (itemRef != NULL) {
+        CFRelease(itemRef);
+    }
+
+    return password ?: @"";
+}
+
+- (BOOL)hasKeychainPasswordForServer:(NSString *)server user:(NSString *)user domain:(NSString *)domain
+{
+    BOOL found = NO;
+    [self keychainPasswordForServer:server user:user domain:domain found:&found];
+    return found;
+}
+
+- (OSStatus)storePasswordInKeychain:(NSString *)password
+                             server:(NSString *)server
+                               user:(NSString *)user
+                             domain:(NSString *)domain
+{
+    SecKeychainItemRef itemRef = NULL;
+    OSStatus status = SecKeychainFindInternetPassword(NULL,
+                                                      (UInt32)[server lengthOfBytesUsingEncoding:NSUTF8StringEncoding],
+                                                      [server UTF8String],
+                                                      (UInt32)[domain lengthOfBytesUsingEncoding:NSUTF8StringEncoding],
+                                                      [domain length] > 0 ? [domain UTF8String] : NULL,
+                                                      (UInt32)[user lengthOfBytesUsingEncoding:NSUTF8StringEncoding],
+                                                      [user UTF8String],
+                                                      0,
+                                                      NULL,
+                                                      0,
+                                                      kSecProtocolTypeSMB,
+                                                      kSecAuthenticationTypeDefault,
+                                                      NULL,
+                                                      NULL,
+                                                      &itemRef);
+    NSData *passwordData = [password dataUsingEncoding:NSUTF8StringEncoding] ?: [NSData data];
+
+    if (status == errSecSuccess && itemRef != NULL) {
+        status = SecKeychainItemModifyAttributesAndData(itemRef,
+                                                        NULL,
+                                                        (UInt32)[passwordData length],
+                                                        [passwordData bytes]);
+        CFRelease(itemRef);
+        return status;
+    }
+
+    if (status != errSecItemNotFound) {
+        if (itemRef != NULL) {
+            CFRelease(itemRef);
+        }
+        return status;
+    }
+
+    return SecKeychainAddInternetPassword(NULL,
+                                          (UInt32)[server lengthOfBytesUsingEncoding:NSUTF8StringEncoding],
+                                          [server UTF8String],
+                                          (UInt32)[domain lengthOfBytesUsingEncoding:NSUTF8StringEncoding],
+                                          [domain length] > 0 ? [domain UTF8String] : NULL,
+                                          (UInt32)[user lengthOfBytesUsingEncoding:NSUTF8StringEncoding],
+                                          [user UTF8String],
+                                          0,
+                                          NULL,
+                                          0,
+                                          kSecProtocolTypeSMB,
+                                          kSecAuthenticationTypeDefault,
+                                          (UInt32)[passwordData length],
+                                          [passwordData bytes],
+                                          NULL);
+}
+
+- (OSStatus)deletePasswordFromKeychainForServer:(NSString *)server
+                                           user:(NSString *)user
+                                         domain:(NSString *)domain
+{
+    SecKeychainItemRef itemRef = NULL;
+    OSStatus status = SecKeychainFindInternetPassword(NULL,
+                                                      (UInt32)[server lengthOfBytesUsingEncoding:NSUTF8StringEncoding],
+                                                      [server UTF8String],
+                                                      (UInt32)[domain lengthOfBytesUsingEncoding:NSUTF8StringEncoding],
+                                                      [domain length] > 0 ? [domain UTF8String] : NULL,
+                                                      (UInt32)[user lengthOfBytesUsingEncoding:NSUTF8StringEncoding],
+                                                      [user UTF8String],
+                                                      0,
+                                                      NULL,
+                                                      0,
+                                                      kSecProtocolTypeSMB,
+                                                      kSecAuthenticationTypeDefault,
+                                                      NULL,
+                                                      NULL,
+                                                      &itemRef);
+
+    if (status != errSecSuccess) {
+        if (itemRef != NULL) {
+            CFRelease(itemRef);
+        }
+        return status;
+    }
+
+    status = SecKeychainItemDelete(itemRef);
+    CFRelease(itemRef);
+    return status;
+}
+
+- (NSString *)securityErrorStringForStatus:(OSStatus)status
+{
+    CFStringRef message = SecCopyErrorMessageString(status, NULL);
+    NSString *string = nil;
+
+    if (message != NULL) {
+        string = CFBridgingRelease(message);
+    }
+    if ([string length] == 0) {
+        string = [NSString stringWithFormat:@"Security error %d", (int)status];
+    }
+    return string;
+}
+
+- (NSArray *)parseShareNamesFromOutput:(NSString *)output
+{
+    NSMutableArray *shares = [NSMutableArray array];
+    NSArray *lines = [output componentsSeparatedByCharactersInSet:[NSCharacterSet newlineCharacterSet]];
+
+    for (NSString *line in lines) {
+        NSString *trimmed = [line stringByTrimmingCharactersInSet:[NSCharacterSet whitespaceAndNewlineCharacterSet]];
+        NSArray *columns = [self columnsFromShareLine:line];
+        NSString *type = nil;
+
+        if ([trimmed length] == 0 ||
+            [trimmed hasPrefix:@"Name"] ||
+            [trimmed hasPrefix:@"----"] ||
+            [trimmed hasPrefix:@"Info:"]) {
+            continue;
+        }
+        if ([columns count] < 2) {
+            continue;
+        }
+
+        type = [columns objectAtIndex:1];
+        if (![type isEqualToString:@"disk"]) {
+            continue;
+        }
+
+        [shares addObject:[columns objectAtIndex:0]];
+    }
+
+    return shares;
+}
+
+- (NSArray *)columnsFromShareLine:(NSString *)line
+{
+    NSMutableArray *columns = [NSMutableArray array];
+    NSRegularExpression *regex = [NSRegularExpression regularExpressionWithPattern:@"\\s{2,}"
+                                                                           options:0
+                                                                             error:NULL];
+    __block NSUInteger start = 0;
+
+    [regex enumerateMatchesInString:line
+                            options:0
+                              range:NSMakeRange(0, [line length])
+                         usingBlock:^(NSTextCheckingResult *result, NSMatchingFlags flags, BOOL *stop) {
+        (void)flags;
+        (void)stop;
+
+        NSRange range = [result range];
+        NSString *piece = [[line substringWithRange:NSMakeRange(start, range.location - start)]
+                           stringByTrimmingCharactersInSet:[NSCharacterSet whitespaceCharacterSet]];
+        if ([piece length] > 0 || [columns count] > 0) {
+            [columns addObject:piece];
+        }
+        start = NSMaxRange(range);
+    }];
+
+    if (start < [line length]) {
+        NSString *tail = [[line substringFromIndex:start] stringByTrimmingCharactersInSet:[NSCharacterSet whitespaceCharacterSet]];
+        if ([tail length] > 0 || [columns count] > 0) {
+            [columns addObject:tail];
+        }
+    }
+
+    return columns;
+}
+
+- (void)loadBookmarks
+{
+    NSArray *stored = [[NSUserDefaults standardUserDefaults] arrayForKey:kSMBBookmarkDefaultsKey];
+    if (!stored) {
+        return;
+    }
+
+    for (NSDictionary *bookmark in stored) {
+        NSMutableDictionary *normalized = [bookmark mutableCopy];
+        if ([[normalized objectForKey:@"uuid"] length] == 0) {
+            [normalized setObject:[self generateBookmarkUUID] forKey:@"uuid"];
+        }
+        [self.bookmarks addObject:normalized];
+    }
+
+    [self persistBookmarks];
+}
+
+- (void)persistBookmarks
+{
+    [[NSUserDefaults standardUserDefaults] setObject:self.bookmarks forKey:kSMBBookmarkDefaultsKey];
+    [[NSUserDefaults standardUserDefaults] synchronize];
+}
+
+- (void)reloadBookmarkList
+{
+    [self refreshMountedBookmarkPathsFromSystem];
+    [self.bookmarksTable reloadData];
+    [self refreshButtons];
+    [self refreshCount];
+    [self rebuildBookmarksMenu];
+    [self updateEmptyState];
+}
+
+- (void)refreshButtons
+{
+    BOOL hasSelection = ([self selectedBookmarkRow] >= 0);
+    NSDictionary *bookmark = [self selectedBookmark];
+    BOOL isMounted = (bookmark != nil && [self isBookmarkMounted:bookmark]);
+    (void)hasSelection;
+    (void)isMounted;
+}
+
+- (void)rebuildBookmarksMenu
+{
+    NSInteger i = 0;
+
+    [self.bookmarksMenu removeAllItems];
+    if ([self.bookmarks count] == 0) {
+        NSMenuItem *empty = [[NSMenuItem alloc] initWithTitle:@"No Connections" action:NULL keyEquivalent:@""];
+        [empty setEnabled:NO];
+        [self.bookmarksMenu addItem:empty];
+        return;
+    }
+
+    for (i = 0; i < (NSInteger)[self.bookmarks count]; i++) {
+        NSDictionary *bookmark = [self.bookmarks objectAtIndex:(NSUInteger)i];
+        NSString *uuid = [bookmark objectForKey:@"uuid"];
+        NSString *title = [self bookmarkMenuTitleForBookmark:bookmark];
+        NSMenuItem *item = [self menuItemWithTitle:title
+                                            action:@selector(selectBookmarkFromMenuItem:)
+                                       keyEquivalent:@""
+                                       keyModifiers:0];
+
+        [item setRepresentedObject:uuid ?: @""];
+        if (i == [self selectedBookmarkRow]) {
+            [item setState:NSOnState];
+        }
+        [self.bookmarksMenu addItem:item];
+    }
+}
+
+- (void)refreshCount
+{
+    NSUInteger count = [self.bookmarks count];
+    [self.countField setStringValue:[NSString stringWithFormat:@"%lu connection%@",
+                                     (unsigned long)count,
+                                     count == 1 ? @"" : @"s"]];
+}
+
+- (void)updateEmptyState
+{
+    BOOL isEmpty = ([self.bookmarks count] == 0);
+    [self.emptyStateView setHidden:!isEmpty];
+    [self.bookmarksTable setHidden:isEmpty];
+    if (isEmpty) {
+        [self setStatus:@"Create a new connection to get started."];
+    }
+}
+
+- (void)setControlsEnabled:(BOOL)enabled
+{
+    self.taskRunning = !enabled;
+    [self refreshButtons];
+}
+
+- (NSDictionary *)selectedBookmark
+{
+    NSInteger row = [self selectedBookmarkRow];
+    if (row < 0 || row >= (NSInteger)[self.bookmarks count]) {
+        return nil;
+    }
+    return [self.bookmarks objectAtIndex:(NSUInteger)row];
+}
+
+- (NSInteger)selectedBookmarkRow
+{
+    NSInteger row = [self.bookmarksTable selectedRow];
+    if (row < 0 || row >= (NSInteger)[self.bookmarks count]) {
+        return -1;
+    }
+    return row;
+}
+
+- (NSString *)bookmarkDisplayName:(NSDictionary *)bookmark
+{
+    NSString *name = [bookmark objectForKey:@"name"];
+    NSString *share = [bookmark objectForKey:@"share"];
+    NSString *server = [bookmark objectForKey:@"server"];
+
+    if ([name length] > 0) {
+        return name;
+    }
+    if ([share length] > 0) {
+        return share;
+    }
+    if ([server length] > 0) {
+        return server;
+    }
+    return @"Untitled Connection";
+}
+
+- (NSString *)bookmarkMenuTitleForBookmark:(NSDictionary *)bookmark
+{
+    NSString *title = [self bookmarkDisplayName:bookmark];
+    NSString *server = [bookmark objectForKey:@"server"] ?: @"";
+    BOOL mounted = [self isBookmarkMounted:bookmark];
+
+    if ([server length] > 0) {
+        title = [NSString stringWithFormat:@"%@ (%@)", title, server];
+    }
+    if (mounted) {
+        title = [NSString stringWithFormat:@"• %@ Connected", title];
+    }
+    return title;
+}
+
+- (NSInteger)rowForBookmarkUUID:(NSString *)uuid
+{
+    NSInteger i = 0;
+
+    if ([uuid length] == 0) {
+        return -1;
+    }
+
+    for (i = 0; i < (NSInteger)[self.bookmarks count]; i++) {
+        NSDictionary *bookmark = [self.bookmarks objectAtIndex:(NSUInteger)i];
+        if ([[bookmark objectForKey:@"uuid"] isEqualToString:uuid]) {
+            return i;
+        }
+    }
+
+    return -1;
+}
+
+- (NSString *)mountedPathForBookmark:(NSDictionary *)bookmark
+{
+    NSString *uuid = [bookmark objectForKey:@"uuid"];
+    if ([uuid length] == 0) {
+        return @"";
+    }
+    return [self.mountedBookmarkPaths objectForKey:uuid] ?: @"";
+}
+
+- (BOOL)isBookmarkMounted:(NSDictionary *)bookmark
+{
+    return [[self mountedPathForBookmark:bookmark] length] > 0;
+}
+
+- (void)openMountedBookmarkInFinder:(NSDictionary *)bookmark
+{
+    NSString *mountpoint = [self mountedPathForBookmark:bookmark];
+
+    if ([mountpoint length] == 0) {
+        [self setStatus:@"This connection is not currently connected."];
+        return;
+    }
+
+    if ([[NSFileManager defaultManager] fileExistsAtPath:mountpoint]) {
+        if ([[NSWorkspace sharedWorkspace] openFile:mountpoint]) {
+            [self setStatus:[NSString stringWithFormat:@"Opened %@ in Finder.", [self bookmarkDisplayName:bookmark]]];
+        } else {
+            [self setStatus:@"Finder could not open the mounted folder."];
+        }
+    } else {
+        NSString *uuid = [bookmark objectForKey:@"uuid"];
+        if ([uuid length] > 0) {
+            [self.mountedBookmarkPaths removeObjectForKey:uuid];
+        }
+        [self reloadBookmarkList];
+        [self setStatus:@"The saved mount path no longer exists."];
+    }
+}
+
+- (NSString *)applicationDisplayName
+{
+    NSString *name = [[[NSBundle mainBundle] infoDictionary] objectForKey:@"CFBundleDisplayName"];
+    if ([name length] == 0) {
+        name = [[[NSBundle mainBundle] infoDictionary] objectForKey:@"CFBundleName"];
+    }
+    if ([name length] == 0) {
+        name = @"SMB2 FUSE";
+    }
+    return name;
+}
+
+- (NSString *)mountpointFromOutput:(NSString *)output
+{
+    NSRegularExpression *regex = [NSRegularExpression regularExpressionWithPattern:@"Using '([^']+)' as mountpoint\\."
+                                                                           options:0
+                                                                             error:NULL];
+    NSTextCheckingResult *match = [regex firstMatchInString:output
+                                                    options:0
+                                                      range:NSMakeRange(0, [output length])];
+    if (!match || [match numberOfRanges] < 2) {
+        return @"";
+    }
+    return [output substringWithRange:[match rangeAtIndex:1]];
+}
+
+- (NSString *)bestGuessMountpointForBookmark:(NSDictionary *)bookmark
+{
+    NSString *share = [bookmark objectForKey:@"share"];
+    NSArray *candidates = [self mountpointCandidatesForBookmark:bookmark];
+    NSFileManager *fm = [NSFileManager defaultManager];
+
+    if ([share length] == 0) {
+        return @"";
+    }
+
+    for (NSString *candidate in candidates) {
+        if ([fm fileExistsAtPath:candidate]) {
+            return candidate;
+        }
+    }
+
+    return [@"/Volumes" stringByAppendingPathComponent:share];
+}
+
+- (NSArray *)mountpointCandidatesForBookmark:(NSDictionary *)bookmark
+{
+    NSString *share = [bookmark objectForKey:@"share"];
+
+    if ([share length] == 0) {
+        return [NSArray array];
+    }
+
+    return [NSArray arrayWithObjects:
+            [@"/Volumes" stringByAppendingPathComponent:share],
+            [[NSHomeDirectory() stringByAppendingPathComponent:@"Volumes"] stringByAppendingPathComponent:share],
+            nil];
+}
+
+- (NSSet *)mountedPathsFromSystem
+{
+    NSString *output = [self outputForCommandAtPath:@"/sbin/mount"
+                                          arguments:nil
+                                  terminationStatus:NULL];
+    NSMutableSet *paths = [NSMutableSet set];
+    NSArray *lines = [output componentsSeparatedByCharactersInSet:[NSCharacterSet newlineCharacterSet]];
+    NSRegularExpression *regex = [NSRegularExpression regularExpressionWithPattern:@" on (.+?) \\("
+                                                                           options:0
+                                                                             error:NULL];
+
+    for (NSString *line in lines) {
+        NSTextCheckingResult *match = [regex firstMatchInString:line
+                                                        options:0
+                                                          range:NSMakeRange(0, [line length])];
+        if (!match || [match numberOfRanges] < 2) {
+            continue;
+        }
+        [paths addObject:[line substringWithRange:[match rangeAtIndex:1]]];
+    }
+
+    return paths;
+}
+
+- (void)refreshMountedBookmarkPathsFromSystem
+{
+    NSSet *mountedPaths = [self mountedPathsFromSystem];
+    NSMutableDictionary *detected = [NSMutableDictionary dictionary];
+
+    for (NSDictionary *bookmark in self.bookmarks) {
+        NSString *uuid = [bookmark objectForKey:@"uuid"];
+        if ([uuid length] == 0) {
+            continue;
+        }
+
+        for (NSString *candidate in [self mountpointCandidatesForBookmark:bookmark]) {
+            if ([mountedPaths containsObject:candidate]) {
+                [detected setObject:candidate forKey:uuid];
+                break;
+            }
+        }
+    }
+
+    self.mountedBookmarkPaths = detected;
+}
+
+- (void)appendOptionalFlag:(NSString *)flag value:(NSString *)value toArguments:(NSMutableArray *)arguments
+{
+    if ([value length] > 0) {
+        [arguments addObject:flag];
+        [arguments addObject:value];
+    }
+}
+
+- (NSString *)generateBookmarkUUID
+{
+    return [NSString stringWithFormat:@"bookmark-%f-%u",
+            [[NSDate date] timeIntervalSince1970],
+            arc4random()];
+}
+
+- (NSString *)trimmedString:(NSString *)string
+{
+    return [string stringByTrimmingCharactersInSet:[NSCharacterSet whitespaceAndNewlineCharacterSet]];
+}
+
+- (NSString *)trimmedStringFromObject:(id)object
+{
+    if (![object isKindOfClass:[NSString class]]) {
+        return @"";
+    }
+    return [self trimmedString:(NSString *)object];
+}
+
+- (NSString *)safeFilenameForConnectionName:(NSString *)name
+{
+    NSMutableString *clean = [NSMutableString string];
+    NSCharacterSet *allowed = [NSCharacterSet characterSetWithCharactersInString:@"abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789-_ "];
+    NSUInteger i = 0;
+
+    if ([name length] == 0) {
+        return @"Connection";
+    }
+
+    for (i = 0; i < [name length]; i++) {
+        unichar c = [name characterAtIndex:i];
+        if ([allowed characterIsMember:c]) {
+            [clean appendFormat:@"%C", c];
+        } else {
+            [clean appendString:@"-"];
+        }
+    }
+
+    while ([clean hasPrefix:@" "]) {
+        [clean deleteCharactersInRange:NSMakeRange(0, 1)];
+    }
+    while ([clean hasSuffix:@" "]) {
+        [clean deleteCharactersInRange:NSMakeRange([clean length] - 1, 1)];
+    }
+
+    if ([clean length] == 0) {
+        return @"Connection";
+    }
+
+    return clean;
+}
+
+- (void)setDictionary:(NSMutableDictionary *)dictionary value:(NSString *)value forKey:(NSString *)key
+{
+    if ([value length] > 0) {
+        [dictionary setObject:value forKey:key];
+    }
+}
+
+- (void)setStatus:(NSString *)status
+{
+    [self.statusField setStringValue:status ?: @""];
+}
+
+- (NSString *)smb2fsExecutablePath
+{
+    NSFileManager *fm = [NSFileManager defaultManager];
+    NSString *resourcePath = [[NSBundle mainBundle] pathForResource:@"smb2fs" ofType:nil];
+    if ([resourcePath length] > 0 && [fm isExecutableFileAtPath:resourcePath]) {
+        return resourcePath;
+    }
+
+    NSString *bundlePath = [[NSBundle mainBundle] bundlePath];
+    NSString *repoPath = [[[[bundlePath stringByDeletingLastPathComponent]
+                            stringByDeletingLastPathComponent]
+                           stringByAppendingPathComponent:@"../smb2fs"] stringByStandardizingPath];
+    if ([fm isExecutableFileAtPath:repoPath]) {
+        return repoPath;
+    }
+
+    if ([fm isExecutableFileAtPath:@"/usr/local/bin/smb2fs"]) {
+        return @"/usr/local/bin/smb2fs";
+    }
+
+    return @"";
+}
+
+- (NSString *)outputForCommandAtPath:(NSString *)path arguments:(NSArray *)arguments terminationStatus:(int *)terminationStatus
+{
+    NSTask *task = nil;
+    NSPipe *pipe = nil;
+    NSString *output = @"";
+
+    if (terminationStatus) {
+        *terminationStatus = -1;
+    }
+    if ([path length] == 0) {
+        return @"";
+    }
+
+    task = [[NSTask alloc] init];
+    pipe = [NSPipe pipe];
+    [task setLaunchPath:path];
+    [task setArguments:arguments ?: [NSArray array]];
+    [task setStandardOutput:pipe];
+    [task setStandardError:pipe];
+
+    @try {
+        [task launch];
+        output = [self readOutputFromPipe:pipe];
+        [task waitUntilExit];
+        if (terminationStatus) {
+            *terminationStatus = [task terminationStatus];
+        }
+    }
+    @catch (NSException *exception) {
+        output = [NSString stringWithFormat:@"Failed to launch task: %@\n", [exception reason]];
+    }
+
+    return output ?: @"";
+}
+
+- (NSString *)outputForCommandAtPath:(NSString *)path
+                           arguments:(NSArray *)arguments
+                            password:(NSString *)password
+                   terminationStatus:(int *)terminationStatus
+{
+    NSTask *task = nil;
+    NSPipe *pipe = nil;
+    NSPipe *inputPipe = nil;
+    NSString *output = @"";
+
+    if (terminationStatus) {
+        *terminationStatus = -1;
+    }
+    if ([path length] == 0) {
+        return @"";
+    }
+
+    task = [[NSTask alloc] init];
+    pipe = [NSPipe pipe];
+    [task setLaunchPath:path];
+    [task setArguments:arguments ?: [NSArray array]];
+    [task setStandardOutput:pipe];
+    [task setStandardError:pipe];
+
+    if (password != nil) {
+        inputPipe = [NSPipe pipe];
+        [task setStandardInput:inputPipe];
+    }
+
+    @try {
+        [task launch];
+        if (inputPipe) {
+            NSData *data = [password dataUsingEncoding:NSUTF8StringEncoding];
+            [[inputPipe fileHandleForWriting] writeData:data];
+            [[inputPipe fileHandleForWriting] closeFile];
+        }
+        output = [self readOutputFromPipe:pipe];
+        [task waitUntilExit];
+        if (terminationStatus) {
+            *terminationStatus = [task terminationStatus];
+        }
+    }
+    @catch (NSException *exception) {
+        output = [NSString stringWithFormat:@"Failed to launch task: %@\n", [exception reason]];
+    }
+
+    return output ?: @"";
+}
+
+- (BOOL)validateMenuItem:(NSMenuItem *)menuItem
+{
+    SEL action = [menuItem action];
+    NSDictionary *bookmark = [self selectedBookmark];
+    BOOL hasSelection = (bookmark != nil);
+    BOOL isMounted = (hasSelection && [self isBookmarkMounted:bookmark]);
+    NSString *uuid = nil;
+
+    if (action == @selector(addBookmark:)) {
+        return !self.taskRunning;
+    }
+    if (action == @selector(importConnections:)) {
+        return !self.taskRunning;
+    }
+    if (action == @selector(selectBookmarkFromMenuItem:)) {
+        uuid = [menuItem representedObject];
+        return ([uuid length] > 0 && [self rowForBookmarkUUID:uuid] >= 0);
+    }
+    if (action == @selector(editBookmark:) ||
+        action == @selector(removeBookmark:) ||
+        action == @selector(duplicateSelectedBookmark:) ||
+        action == @selector(listShares:)) {
+        return hasSelection && !self.taskRunning;
+    }
+    if (action == @selector(exportSelectedBookmark:)) {
+        return hasSelection && !self.taskRunning;
+    }
+    if (action == @selector(exportAllBookmarks:)) {
+        return ([self.bookmarks count] > 0) && !self.taskRunning;
+    }
+    if (action == @selector(connectSelectedBookmark:)) {
+        return hasSelection && !isMounted && !self.taskRunning;
+    }
+    if (action == @selector(disconnectSelectedBookmark:) ||
+        action == @selector(openSelectedBookmarkInFinder:) ||
+        action == @selector(revealSelectedMountPoint:) ||
+        action == @selector(activateSelectedBookmark:)) {
+        return hasSelection && isMounted && !self.taskRunning;
+    }
+    if (action == @selector(closeWindow:)) {
+        return ([self.window isVisible] != NO);
+    }
+    return YES;
+}
+
+@end
