@@ -33,8 +33,7 @@ This is the environment I used. Other configurations may work, but this is what 
 
 - **OS:** macOS 10.7 (Lion)
 - **Dev tools:** Xcode + Command Line Tools
-- **Package manager:** [MacPorts](https://www.macports.org)
-- **FUSE:** OSXFUSE 2.7.5
+- **FUSE:** FUSE for macOS 3.11.2 from the official archive
 - **Library:** libsmb2 (included as a git submodule)
 
 ---
@@ -56,27 +55,19 @@ cd smb2fuse
 
 On older macOS versions the App Store may not offer a compatible Xcode version. Download the `.dmg` directly from https://developer.apple.com/download/all/?q=Xcode after having signed in with your Apple ID. Once downloaded, install Xcode, then install the command line tools either from Xcode's Preferences > Downloads or download the `.dmg` for your macOS version from https://developer.apple.com/download/all/?q=Command%20Line%20Tools.
 
-**MacPorts**
+**FUSE for macOS**
 
-Download the `.pkg` for your macOS version from https://www.macports.org/install.php, then update the ports tree:
+Download the legacy FUSE package directly from the official archive:
 
-```bash
-sudo port selfupdate
-```
-
-**OSXFUSE**
-
-On macOS 10.7 (Lion), you can install OSXFUSE 2.7.5 using MacPorts:
-
-```bash
-sudo port install osxfuse @2.7.5
-```
+https://macfuse.github.io/archive.html
 
 Then load the kernel extension:
 
 ```bash
-sudo kextload /Library/Extensions/osxfusefs.kext
+sudo /Library/Filesystems/osxfuse.fs/Contents/Resources/load_osxfuse
 ```
+
+If you are installing or upgrading FUSE on an existing Lion machine, a reboot before the first mount attempt is strongly recommended.
 
 
 ### 3. Build libsmb2
@@ -130,6 +121,20 @@ cd ..
 ### 4. Build smb2fuse
 
 ```bash
+make
+```
+
+`_FILE_OFFSET_BITS=64` is required to support files larger than 2 GB. The source now defines it by default, but keeping the compile flag is still recommended for clarity.
+
+The root `Makefile` uses the same flags shown below and defaults to `PREFIX=/usr/local`. If needed, you can override it:
+
+```bash
+make PREFIX=/usr/local
+```
+
+Equivalent build command:
+
+```bash
 gcc -o smb2fs smb2fs.c \
     -I/usr/local/include/osxfuse/fuse \
     -I/usr/local/include/osxfuse \
@@ -141,16 +146,13 @@ gcc -o smb2fs smb2fs.c \
     -D_FILE_OFFSET_BITS=64
 ```
 
-`_FILE_OFFSET_BITS=64` is required to support files larger than 2 GB. The source now defines it by default, but keeping the compile flag is still recommended for clarity.
-
 > **Note:** libsmb2 is linked as a static archive (`/usr/local/lib/libsmb2.a`) rather than via `-lsmb2`. On this toolchain the dynamic library does not export all symbols, so the static archive must be specified directly.
 
-> **Important (OSXFUSE linkage):** If both `/opt/local` and `/usr/local` OSXFUSE libraries are installed, link `smb2fs` against `/usr/local/lib/libosxfuse.2.dylib`. Linking against `/opt/local/lib/libosxfuse.2.dylib` can cause mount handoff failure with:
-> `This program is not meant to be called directly. The OSXFUSE library calls it.`
+> **Important (FUSE linkage):** `smb2fs` expects the official FUSE install under `/usr/local` and should link against `/usr/local/lib/libosxfuse.2.dylib`.
 >
 > Verify the binary with:
 > ```bash
-> otool -L ./smb2fs | egrep -i 'osxfuse|fuse'
+> make check-link
 > ```
 > Expected:
 > `... /usr/local/lib/libosxfuse.2.dylib ...`
@@ -159,36 +161,59 @@ gcc -o smb2fs smb2fs.c \
 
 ## Usage
 
-Create a mount point and run `smb2fs`:
+Run `smb2fs` with an explicit mount point:
 
 ```bash
 mkdir ~/mnt
-./smb2fs ~/mnt -o server=192.168.1.1,share=MyShare,user=alice,domain=MYDOMAIN
+./smb2fs ~/mnt --server 192.168.1.1 --share MyShare --user alice --domain MYDOMAIN
 ```
 
-For better security, avoid passing `password=...` on the command line. Prefer one of:
+If you omit the mount point, `smb2fs` creates one automatically using this fallback order:
+
+1. `/Volumes/<share>`
+2. `~/Volumes/<share>`
+3. `./<share>`
+
+SMB connection parameters now use dedicated CLI options. The old `-o server=...,share=...,user=...` form is no longer supported.
+
+`--user` is optional. If you omit it, `smb2fs` attempts guest/anonymous access.
+
+If you set a user but do not pass any password option, `smb2fs` prompts interactively by default.
+
+To list the shares visible on a host for the current credentials:
+
+```bash
+./smb2fs --list-shares --server 192.168.1.1 --user alice --domain MYDOMAIN
+```
+
+For better security, avoid passing `--password ...` on the command line. `--password` remains available as a convenience option, but it can leak into shell history and briefly into process arguments. If you omit all password options and a user is set, `smb2fs` uses the interactive prompt automatically. You can also choose one of these explicitly:
 
 ```bash
 # Interactive prompt (no password in argv/history)
-./smb2fs ~/mnt -o server=192.168.1.1,share=MyShare,user=alice,password_prompt,domain=MYDOMAIN
+./smb2fs ~/mnt --server 192.168.1.1 --share MyShare --user alice --password-prompt --domain MYDOMAIN
 
 # File descriptor (example uses stdin as fd 0)
-printf '%s' 'secret' | ./smb2fs ~/mnt -o server=192.168.1.1,share=MyShare,user=alice,passfd=0,domain=MYDOMAIN
+printf '%s' 'secret' | ./smb2fs ~/mnt --server 192.168.1.1 --share MyShare --user alice --passfd 0 --domain MYDOMAIN
 ```
-
-You can also use `~/.nsmbrc` (`DOMAIN:USERNAME:PASSWORD`) if preferred.
 
 | Option     | Required | Description                          |
 |------------|----------|--------------------------------------|
-| `server`   | yes      | IP address or hostname of the server |
-| `share`    | yes      | Name of the SMB share                |
-| `user`     | yes      | Username                             |
-| `password` | no       | Password (avoid command line if possible) |
-| `passfd`   | no       | Read password from file descriptor     |
-| `password_prompt` | no | Read password via interactive prompt |
-| `domain`   | no       | Windows/AD domain name               |
+| `--list-shares` | no   | List visible shares on the server and exit |
+| `--server`   | yes      | IP address or hostname of the server |
+| `--share`    | yes      | Name of the SMB share                |
+| `--user`     | no       | Username; omit it to attempt guest/anonymous access |
+| `--password` | no       | Convenience option; may leak via shell history and process arguments |
+| `--passfd`   | no       | Read password from file descriptor   |
+| `--password-prompt` | no | Read password via interactive prompt |
+| `--domain`   | no       | Windows/AD domain name; a trailing `.local` is stripped automatically |
+| `--volname`  | no       | Finder-visible volume label; defaults to `share` |
+| `--help`     | no       | Show built-in help and exit          |
 
-Use only one password source at a time: `password`, `passfd`, or `password_prompt`.
+Use only one password source at a time: `--password`, `--passfd`, or `--password-prompt`. If you omit all three and a user is set, the interactive prompt is used automatically. If you omit both user and password options, `smb2fs` attempts guest/anonymous access.
+
+Generic FUSE options are still passed separately, for example `-f`, `-d`, or `-o allow_other`.
+
+`--list-shares` connects to `IPC$`, prints the browseable shares visible to the current credentials, hides the administrative `IPC$` entry, and exits without mounting. Some servers do not allow anonymous enumeration, so guest mode may fail unless you provide `--user`.
 
 To unmount:
 
@@ -196,7 +221,7 @@ To unmount:
 umount ~/mnt
 ```
 
-> **Do not run `smb2fs` with `sudo`.** OSXFUSE 2.7 requires the mount process to run as the user who owns the FUSE device. Running as root will fail with "Operation not permitted".
+> **Do not run `smb2fs` with `sudo`.** On Lion, the FUSE mount process needs to run as the logged-in user who owns the FUSE device. Running as root can fail with "Operation not permitted".
 
 ---
 
@@ -205,7 +230,7 @@ umount ~/mnt
 - **Single-threaded:** libsmb2 is not thread-safe. `smb2fs` passes `-s` to FUSE to enforce single-threaded operation.
 - **Static permissions:** All directories are hardcoded to `0755` and files to `0644`, owned by the user who ran the mount. Actual SMB permissions are not reflected.
 - **No SMB1:** Only SMB2 and above are supported.
-- **Limited testing:** Only tested on macOS 10.7 Lion with OSXFUSE 2.7.5 and libsmb2 built from source.
+- **Limited testing:** Only tested on macOS 10.7 Lion with FUSE for macOS 3.11.2 and libsmb2 built from source.
 
 ---
 

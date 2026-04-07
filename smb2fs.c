@@ -1,12 +1,20 @@
 /* smb2fs.c - FUSE filesystem for SMB2 shares using libsmb2
  *
- * Usage: smb2fs <mountpoint> -o server=HOST,share=SHARE,user=USER[,password=PASS|passfd=FD|password_prompt][,domain=DOMAIN]
+ * Usage: smb2fs [mountpoint] --server HOST --share SHARE [--user USER]
+ *        [--password PASS|--passfd FD|--password-prompt] [--domain DOMAIN]
+ *        [--volname NAME] [FUSE options]
+ *        If mountpoint is omitted, smb2fs tries /Volumes/<share>, then ~/Volumes/<share>,
+ *        then ./<share>.
+ *        If no password source is provided, smb2fs prompts interactively when a user is set;
+ *        otherwise it attempts guest/anonymous access.
+ *        Prefer --password-prompt or --passfd over --password to avoid argv/history exposure.
  *
- * Build on macOS with OSXFUSE:
+ * Build on macOS with the official FUSE for macOS install:
  *   gcc -o smb2fs smb2fs.c \
- *       -I/opt/local/include/osxfuse/fuse -I/opt/local/include/osxfuse -I/usr/local/include \
- *       -L/usr/local/lib -lsmb2 \
- *       -L/opt/local/lib -losxfuse \
+ *       -I/usr/local/include/osxfuse/fuse -I/usr/local/include/osxfuse -I/usr/local/include \
+ *       /usr/local/lib/libsmb2.a \
+ *       /usr/local/lib/libosxfuse.2.dylib \
+ *       -Wl,-rpath,/usr/local/lib \
  *       -O2 \
  *       -D_FILE_OFFSET_BITS=64
  */
@@ -25,6 +33,7 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <ctype.h>
 #include <errno.h>
 #include <limits.h>
 #include <fcntl.h>
@@ -33,6 +42,7 @@
 
 #include <smb2/smb2.h>
 #include <smb2/libsmb2.h>
+#include <smb2/libsmb2-raw.h>
 #include <smb2/smb2-errors.h>
 
 static struct smb2_context *smb2_ctx = NULL;
@@ -62,17 +72,40 @@ static int smb2fs_errno(void)
     return -EIO;
 }
 
+static int smb2fs_result(int rc)
+{
+    return (rc < 0) ? rc : 0;
+}
+
 struct smb2fs_config {
     char *server;
     char *share;
     char *user;
     char *password;
     char *domain;
+    char *volname;
     int   passfd;
     int   password_prompt;
+    int   list_shares;
 };
 
-static struct smb2fs_config cfg = { NULL, NULL, NULL, NULL, NULL, -1, 0 };
+static struct smb2fs_config cfg = { NULL, NULL, NULL, NULL, NULL, NULL, -1, 0, 0 };
+
+struct smb2fs_handle {
+    struct smb2fh *fh;
+    int open_flags;
+    char *path;
+};
+
+static void smb2fs_secure_free(char **ptr, size_t len)
+{
+    if (!ptr || !*ptr)
+        return;
+    if (len > 0)
+        secure_zero(*ptr, len);
+    free(*ptr);
+    *ptr = NULL;
+}
 
 static void smb2fs_free_config(void)
 {
@@ -89,8 +122,550 @@ static void smb2fs_free_config(void)
     }
     free(cfg.domain);
     cfg.domain = NULL;
+    free(cfg.volname);
+    cfg.volname = NULL;
     cfg.passfd = -1;
     cfg.password_prompt = 0;
+    cfg.list_shares = 0;
+}
+
+static int smb2fs_set_string(char **dst, const char *value)
+{
+    char *copy;
+
+    if (!dst || !value)
+        return -1;
+
+    copy = strdup(value);
+    if (!copy)
+        return -1;
+
+    free(*dst);
+    *dst = copy;
+    return 0;
+}
+
+static int smb2fs_parse_int(const char *value, int *out)
+{
+    char *end;
+    long parsed;
+
+    if (!value || !out)
+        return -1;
+
+    errno = 0;
+    parsed = strtol(value, &end, 10);
+    if (errno != 0 || !end || *end != '\0' ||
+        parsed < INT_MIN || parsed > INT_MAX) {
+        return -1;
+    }
+
+    *out = (int)parsed;
+    return 0;
+}
+
+static int smb2fs_strip_local_domain_suffix(char *domain)
+{
+    static const char suffix[] = ".local";
+    size_t domain_len;
+    size_t suffix_len = sizeof(suffix) - 1;
+    size_t i;
+
+    if (!domain)
+        return 0;
+
+    domain_len = strlen(domain);
+    if (domain_len <= suffix_len)
+        return 0;
+
+    for (i = 0; i < suffix_len; i++) {
+        unsigned char ch = (unsigned char)domain[domain_len - suffix_len + i];
+        if (tolower(ch) != (unsigned char)suffix[i])
+            return 0;
+    }
+
+    domain[domain_len - suffix_len] = '\0';
+    return 1;
+}
+
+static void smb2fs_print_usage(FILE *stream, const char *progname)
+{
+    fprintf(stream,
+        "Usage:\n"
+        "  %s --list-shares --server HOST [--user USER]\n"
+        "     [--password PASS | --passfd FD | --password-prompt]\n"
+        "     [--domain DOMAIN]\n"
+        "\n"
+        "  %s [mountpoint] --server HOST --share SHARE [--user USER]\n"
+        "     [--password PASS | --passfd FD | --password-prompt]\n"
+        "     [--domain DOMAIN] [--volname NAME] [FUSE options]\n"
+        "\n"
+        "Options:\n"
+        "  --list-shares           List shares visible on the server and exit\n"
+        "  --server HOST           SMB server hostname or IP address\n"
+        "  --share SHARE           SMB share name\n"
+        "  --user USER             SMB username (optional; omitted means guest/anonymous attempt)\n"
+        "  --password PASS         Convenience option; prefer safer methods\n"
+        "  --passfd FD             Read password from file descriptor FD\n"
+        "  --password-prompt       Prompt interactively for the password\n"
+        "  --domain DOMAIN         Windows/AD domain name\n"
+        "  --volname NAME          Finder-visible volume label (defaults to share)\n"
+        "  -h, --help              Show this help message and exit\n"
+        "\n"
+        "Notes:\n"
+        "  If a user is set and no password source is provided, smb2fs prompts interactively.\n"
+        "  If no user and no password source are provided, smb2fs attempts guest/anonymous access.\n"
+        "  Prefer --password-prompt or --passfd over --password to avoid argv/history exposure.\n"
+        "  Mountpoint is optional; if omitted, smb2fs auto-creates one from the share name.\n",
+        progname, progname);
+}
+
+static int smb2fs_copy_passthrough_arg(struct fuse_args *raw_args,
+                                       const char *arg)
+{
+    if (!raw_args || !arg)
+        return -1;
+
+    if (fuse_opt_add_arg(raw_args, arg) < 0) {
+        return -1;
+    }
+
+    return 0;
+}
+
+static int smb2fs_consume_value_arg(int argc, char *argv[], int *index,
+                                    const char *inline_value,
+                                    const char **value_out)
+{
+    if (!index || !value_out)
+        return -1;
+
+    if (inline_value) {
+        *value_out = inline_value;
+        return 0;
+    }
+
+    if ((*index + 1) >= argc)
+        return -1;
+
+    (*index)++;
+    *value_out = argv[*index];
+    return 0;
+}
+
+static char *smb2fs_next_opt_token(char *tok, char **next_out);
+
+static int smb2fs_is_legacy_smb_option_token(const char *opt)
+{
+    if (!opt)
+        return 0;
+
+    return (strncmp(opt, "server=", 7) == 0) ||
+           (strncmp(opt, "share=", 6) == 0) ||
+           (strncmp(opt, "user=", 5) == 0) ||
+           (strncmp(opt, "password=", 9) == 0) ||
+           (strncmp(opt, "domain=", 7) == 0) ||
+           (strncmp(opt, "passfd=", 7) == 0) ||
+           (strncmp(opt, "volname=", 8) == 0) ||
+           (strcmp(opt, "password_prompt") == 0);
+}
+
+static int smb2fs_optlist_has_legacy_smb_token(const char *optlist)
+{
+    char *in;
+    char *tok;
+    char *next;
+    int found = 0;
+
+    if (!optlist)
+        return 0;
+
+    in = strdup(optlist);
+    if (!in)
+        return 0;
+
+    tok = in;
+    while (tok && *tok) {
+        tok = smb2fs_next_opt_token(tok, &next);
+        if (*tok != '\0' && smb2fs_is_legacy_smb_option_token(tok)) {
+            found = 1;
+            break;
+        }
+        tok = next;
+    }
+
+    free(in);
+    return found;
+}
+
+static int smb2fs_parse_cli_args(int argc, char *argv[],
+                                 struct fuse_args *raw_args,
+                                 int *help_out)
+{
+    int i;
+    int stop_parsing = 0;
+
+    if (!raw_args || !help_out || argc < 1 || !argv || !argv[0])
+        return -1;
+
+    *help_out = 0;
+
+    if (fuse_opt_add_arg(raw_args, argv[0]) < 0) {
+        return -1;
+    }
+
+    for (i = 1; i < argc; i++) {
+        const char *arg = argv[i];
+        const char *value = NULL;
+
+        if (!arg)
+            continue;
+
+        if (stop_parsing) {
+            if (smb2fs_copy_passthrough_arg(raw_args, arg) < 0)
+                return -1;
+            continue;
+        }
+
+        if (strcmp(arg, "--") == 0) {
+            stop_parsing = 1;
+            if (smb2fs_copy_passthrough_arg(raw_args, arg) < 0)
+                return -1;
+            continue;
+        }
+
+        if (strcmp(arg, "-h") == 0 || strcmp(arg, "--help") == 0) {
+            *help_out = 1;
+            continue;
+        }
+
+        if (strcmp(arg, "--list-shares") == 0) {
+            cfg.list_shares = 1;
+            continue;
+        }
+
+        if (strncmp(arg, "--server", 8) == 0 &&
+            (arg[8] == '\0' || arg[8] == '=')) {
+            if (smb2fs_consume_value_arg(argc, argv, &i,
+                                         (arg[8] == '=') ? arg + 9 : NULL,
+                                         &value) < 0 ||
+                smb2fs_set_string(&cfg.server, value) < 0) {
+                return -1;
+            }
+            continue;
+        }
+
+        if (strncmp(arg, "--share", 7) == 0 &&
+            (arg[7] == '\0' || arg[7] == '=')) {
+            if (smb2fs_consume_value_arg(argc, argv, &i,
+                                         (arg[7] == '=') ? arg + 8 : NULL,
+                                         &value) < 0 ||
+                smb2fs_set_string(&cfg.share, value) < 0) {
+                return -1;
+            }
+            continue;
+        }
+
+        if (strncmp(arg, "--user", 6) == 0 &&
+            (arg[6] == '\0' || arg[6] == '=')) {
+            if (smb2fs_consume_value_arg(argc, argv, &i,
+                                         (arg[6] == '=') ? arg + 7 : NULL,
+                                         &value) < 0 ||
+                smb2fs_set_string(&cfg.user, value) < 0) {
+                return -1;
+            }
+            continue;
+        }
+
+        if (strncmp(arg, "--password", 10) == 0 &&
+            (arg[10] == '\0' || arg[10] == '=')) {
+            if (smb2fs_consume_value_arg(argc, argv, &i,
+                                         (arg[10] == '=') ? arg + 11 : NULL,
+                                         &value) < 0 ||
+                smb2fs_set_string(&cfg.password, value) < 0) {
+                return -1;
+            }
+            continue;
+        }
+
+        if (strncmp(arg, "--passfd", 8) == 0 &&
+            (arg[8] == '\0' || arg[8] == '=')) {
+            int fd;
+            if (smb2fs_consume_value_arg(argc, argv, &i,
+                                         (arg[8] == '=') ? arg + 9 : NULL,
+                                         &value) < 0 ||
+                smb2fs_parse_int(value, &fd) < 0) {
+                return -1;
+            }
+            cfg.passfd = fd;
+            continue;
+        }
+
+        if (strcmp(arg, "--password-prompt") == 0) {
+            cfg.password_prompt = 1;
+            continue;
+        }
+
+        if (strncmp(arg, "--domain", 8) == 0 &&
+            (arg[8] == '\0' || arg[8] == '=')) {
+            if (smb2fs_consume_value_arg(argc, argv, &i,
+                                         (arg[8] == '=') ? arg + 9 : NULL,
+                                         &value) < 0 ||
+                smb2fs_set_string(&cfg.domain, value) < 0) {
+                return -1;
+            }
+            continue;
+        }
+
+        if (strncmp(arg, "--volname", 9) == 0 &&
+            (arg[9] == '\0' || arg[9] == '=')) {
+            if (smb2fs_consume_value_arg(argc, argv, &i,
+                                         (arg[9] == '=') ? arg + 10 : NULL,
+                                         &value) < 0 ||
+                smb2fs_set_string(&cfg.volname, value) < 0) {
+                return -1;
+            }
+            continue;
+        }
+
+        if (smb2fs_is_legacy_smb_option_token(arg))
+            return -1;
+
+        if (strcmp(arg, "-o") == 0 && (i + 1) < argc) {
+            if (smb2fs_optlist_has_legacy_smb_token(argv[i + 1]))
+                return -1;
+            if (smb2fs_copy_passthrough_arg(raw_args, arg) < 0 ||
+                smb2fs_copy_passthrough_arg(raw_args, argv[++i]) < 0) {
+                return -1;
+            }
+            continue;
+        }
+
+        if (arg[0] == '-' && arg[1] == 'o' && arg[2] != '\0' &&
+            smb2fs_optlist_has_legacy_smb_token(arg + 2)) {
+            return -1;
+        }
+
+        if (smb2fs_copy_passthrough_arg(raw_args, arg) < 0)
+            return -1;
+    }
+
+    return 0;
+}
+
+static char *smb2fs_join_path(const char *base, const char *leaf)
+{
+    size_t base_len;
+    size_t leaf_len;
+    int need_slash;
+    char *path;
+
+    if (!base || !leaf)
+        return NULL;
+
+    base_len = strlen(base);
+    leaf_len = strlen(leaf);
+    need_slash = (base_len > 0 && base[base_len - 1] != '/');
+
+    path = malloc(base_len + need_slash + leaf_len + 1);
+    if (!path)
+        return NULL;
+
+    memcpy(path, base, base_len);
+    if (need_slash)
+        path[base_len++] = '/';
+    memcpy(path + base_len, leaf, leaf_len + 1);
+    return path;
+}
+
+static char *smb2fs_join_unc_path(const char *server, const char *share)
+{
+    size_t server_len;
+    size_t share_len;
+    char *path;
+
+    if (!server || !share)
+        return NULL;
+
+    server_len = strlen(server);
+    share_len = strlen(share);
+    path = malloc(2 + server_len + 1 + share_len + 1);
+    if (!path)
+        return NULL;
+
+    path[0] = '/';
+    path[1] = '/';
+    memcpy(path + 2, server, server_len);
+    path[2 + server_len] = '/';
+    memcpy(path + 2 + server_len + 1, share, share_len + 1);
+    return path;
+}
+
+static int smb2fs_prepare_directory(const char *path, int *created_out)
+{
+    struct stat st;
+
+    if (!path)
+        return -1;
+
+    if (created_out)
+        *created_out = 0;
+
+    if (mkdir(path, 0755) == 0) {
+        if (created_out)
+            *created_out = 1;
+        return 0;
+    }
+
+    if (errno != EEXIST)
+        return -1;
+
+    if (stat(path, &st) < 0)
+        return -1;
+
+    if (!S_ISDIR(st.st_mode)) {
+        errno = ENOTDIR;
+        return -1;
+    }
+
+    return 0;
+}
+
+static int smb2fs_should_try_next_mountpoint(int err)
+{
+    switch (err) {
+    case EACCES:
+    case EPERM:
+    case EROFS:
+    case ENOTDIR:
+    case ENOENT:
+    case ELOOP:
+        return 1;
+    default:
+        return 0;
+    }
+}
+
+static int smb2fs_prepare_auto_mountpoint(const char *share,
+                                          char **mountpoint_out,
+                                          int *mountpoint_created_out,
+                                          char **parent_out,
+                                          int *parent_created_out)
+{
+    char *path = NULL;
+    char *home_volumes = NULL;
+    const char *home;
+    int err;
+
+    if (!share || !mountpoint_out || !mountpoint_created_out ||
+        !parent_out || !parent_created_out) {
+        errno = EINVAL;
+        return -1;
+    }
+
+    *mountpoint_out = NULL;
+    *mountpoint_created_out = 0;
+    *parent_out = NULL;
+    *parent_created_out = 0;
+
+    path = smb2fs_join_path("/Volumes", share);
+    if (!path) {
+        errno = ENOMEM;
+        return -1;
+    }
+    if (smb2fs_prepare_directory(path, mountpoint_created_out) == 0) {
+        *mountpoint_out = path;
+        return 0;
+    }
+    err = errno;
+    free(path);
+    path = NULL;
+    if (!smb2fs_should_try_next_mountpoint(err)) {
+        errno = err;
+        return -1;
+    }
+
+    home = getenv("HOME");
+    if (home && home[0] != '\0') {
+        home_volumes = smb2fs_join_path(home, "Volumes");
+        if (!home_volumes) {
+            errno = ENOMEM;
+            return -1;
+        }
+        if (smb2fs_prepare_directory(home_volumes, parent_created_out) == 0) {
+            path = smb2fs_join_path(home_volumes, share);
+            if (!path) {
+                if (*parent_created_out)
+                    (void)rmdir(home_volumes);
+                free(home_volumes);
+                errno = ENOMEM;
+                return -1;
+            }
+            if (smb2fs_prepare_directory(path, mountpoint_created_out) == 0) {
+                *mountpoint_out = path;
+                *parent_out = home_volumes;
+                return 0;
+            }
+            err = errno;
+            free(path);
+            path = NULL;
+            if (*parent_created_out)
+                (void)rmdir(home_volumes);
+            free(home_volumes);
+            home_volumes = NULL;
+            *parent_created_out = 0;
+            if (!smb2fs_should_try_next_mountpoint(err)) {
+                errno = err;
+                return -1;
+            }
+        } else {
+            err = errno;
+            free(home_volumes);
+            home_volumes = NULL;
+            if (!smb2fs_should_try_next_mountpoint(err)) {
+                errno = err;
+                return -1;
+            }
+        }
+    }
+
+    path = strdup(share);
+    if (!path) {
+        errno = ENOMEM;
+        return -1;
+    }
+    if (smb2fs_prepare_directory(path, mountpoint_created_out) == 0) {
+        *mountpoint_out = path;
+        return 0;
+    }
+
+    err = errno;
+    free(path);
+    errno = err;
+    return -1;
+}
+
+static void smb2fs_cleanup_auto_mountpoint(char **mountpoint,
+                                           int *mountpoint_created,
+                                           char **parent,
+                                           int *parent_created)
+{
+    if (mountpoint && *mountpoint) {
+        if (mountpoint_created && *mountpoint_created)
+            (void)rmdir(*mountpoint);
+        free(*mountpoint);
+        *mountpoint = NULL;
+    }
+    if (parent && *parent) {
+        if (parent_created && *parent_created)
+            (void)rmdir(*parent);
+        free(*parent);
+        *parent = NULL;
+    }
+    if (mountpoint_created)
+        *mountpoint_created = 0;
+    if (parent_created)
+        *parent_created = 0;
 }
 
 static int smb2fs_password_from_fd(int fd, char **password_out)
@@ -109,7 +684,7 @@ static int smb2fs_password_from_fd(int fd, char **password_out)
     while ((nread = read(fd, chunk, sizeof(chunk))) > 0) {
         if (len + (size_t)nread > 65536) {
             secure_zero(chunk, sizeof(chunk));
-            free(buf);
+            smb2fs_secure_free(&buf, len);
             return -1;
         }
         if (len + (size_t)nread + 1 > cap) {
@@ -118,10 +693,7 @@ static int smb2fs_password_from_fd(int fd, char **password_out)
                 newcap *= 2;
             tmp = realloc(buf, newcap);
             if (!tmp) {
-                if (buf) {
-                    secure_zero(buf, len);
-                    free(buf);
-                }
+                smb2fs_secure_free(&buf, len);
                 secure_zero(chunk, sizeof(chunk));
                 return -1;
             }
@@ -135,10 +707,7 @@ static int smb2fs_password_from_fd(int fd, char **password_out)
     secure_zero(chunk, sizeof(chunk));
 
     if (nread < 0) {
-        if (buf) {
-            secure_zero(buf, len);
-            free(buf);
-        }
+        smb2fs_secure_free(&buf, len);
         return -1;
     }
 
@@ -207,70 +776,296 @@ static void scrub_password_argv(struct fuse_args *args)
     }
 }
 
-static int smb2fs_is_smb_option_token(const char *opt)
+static char *smb2fs_next_opt_token(char *tok, char **next_out)
 {
-    if (!opt)
-        return 0;
-    return (strncmp(opt, "server=", 7) == 0) ||
-           (strncmp(opt, "share=", 6) == 0) ||
-           (strncmp(opt, "user=", 5) == 0) ||
-           (strncmp(opt, "password=", 9) == 0) ||
-           (strncmp(opt, "domain=", 7) == 0) ||
-           (strncmp(opt, "passfd=", 7) == 0) ||
-           (strcmp(opt, "password_prompt") == 0);
+    char *p;
+
+    if (!next_out)
+        return tok;
+
+    *next_out = NULL;
+    if (!tok)
+        return NULL;
+
+    for (p = tok; *p != '\0'; p++) {
+        if (*p == '\\' && p[1] != '\0') {
+            p++;
+            continue;
+        }
+        if (*p == ',') {
+            *p = '\0';
+            *next_out = p + 1;
+            break;
+        }
+    }
+
+    return tok;
 }
 
-/* Remove smb2fs-specific tokens from a comma-separated -o option list. */
-static char *smb2fs_filter_mount_optlist(const char *optlist)
+/*
+ * Return 1 if a mountpoint (positional, non-option argument) is present in
+ * the arg list, 0 otherwise.  Skips argv[0] and the value token after -o.
+ */
+static int smb2fs_has_mountpoint(const struct fuse_args *args)
 {
-    char *in;
-    char *out;
-    char *tok;
-    char *next;
-    size_t out_len = 0;
-    size_t max_len;
-    int first = 1;
+    int i;
+    for (i = 1; i < args->argc; i++) {
+        const char *arg = args->argv[i];
+        if (!arg)
+            continue;
+        if (arg[0] == '-') {
+            if (arg[1] == 'o' && arg[2] == '\0')
+                i++; /* skip the option-list value that follows */
+            continue;
+        }
+        return 1; /* positional argument found = mountpoint */
+    }
+    return 0;
+}
+
+static int smb2fs_add_generated_mount_opt(struct fuse_args *dst, const char *opt)
+{
+    char *optlist = NULL;
+
+    if (!dst || !opt)
+        return -1;
+
+    if (fuse_opt_add_opt_escaped(&optlist, opt) < 0) {
+        free(optlist);
+        return -1;
+    }
 
     if (!optlist)
-        return NULL;
+        return -1;
 
-    max_len = strlen(optlist) + 1;
-    in = strdup(optlist);
-    out = malloc(max_len);
-    if (!in || !out) {
-        free(in);
-        free(out);
-        return NULL;
+    if (fuse_opt_add_arg(dst, "-o") < 0 ||
+        fuse_opt_add_arg(dst, optlist) < 0) {
+        free(optlist);
+        return -1;
     }
-    out[0] = '\0';
 
-    tok = in;
-    while (tok && *tok) {
-        next = strchr(tok, ',');
-        if (next) {
-            *next = '\0';
-            next++;
+    free(optlist);
+    return 0;
+}
+
+static int smb2fs_add_generated_keyval_opt(struct fuse_args *dst,
+                                           const char *key,
+                                           const char *value)
+{
+    char *opt;
+    size_t key_len;
+    size_t value_len;
+    int rc;
+
+    if (!dst || !key || !value)
+        return -1;
+
+    key_len = strlen(key);
+    value_len = strlen(value);
+    opt = malloc(key_len + 1 + value_len + 1);
+    if (!opt)
+        return -1;
+
+    memcpy(opt, key, key_len);
+    opt[key_len] = '=';
+    memcpy(opt + key_len + 1, value, value_len + 1);
+    rc = smb2fs_add_generated_mount_opt(dst, opt);
+    free(opt);
+    return rc;
+}
+
+static int smb2fs_access_mode(int flags, int default_mode)
+{
+    switch (flags & O_ACCMODE) {
+    case O_RDONLY:
+    case O_WRONLY:
+    case O_RDWR:
+        return flags & O_ACCMODE;
+    default:
+        return default_mode;
+    }
+}
+
+static int smb2fs_supported_open_flags(int fuse_flags, int default_mode,
+                                       int creating)
+{
+    int flags = smb2fs_access_mode(fuse_flags, default_mode);
+
+    if (fuse_flags & O_SYNC)
+        flags |= O_SYNC;
+    if (fuse_flags & O_TRUNC)
+        flags |= O_TRUNC;
+    if (creating) {
+        flags |= O_CREAT;
+        if (fuse_flags & O_EXCL)
+            flags |= O_EXCL;
+    }
+
+    return flags;
+}
+
+static struct smb2fs_handle *smb2fs_handle_from_fi(struct fuse_file_info *fi)
+{
+    if (!fi || fi->fh == 0)
+        return NULL;
+    return (struct smb2fs_handle *)(uintptr_t)fi->fh;
+}
+
+static int smb2fs_set_handle(struct fuse_file_info *fi,
+                             const char *smb_path,
+                             struct smb2fh *fh,
+                             int open_flags)
+{
+    struct smb2fs_handle *handle;
+
+    if (!fi || !smb_path || !fh)
+        return -EINVAL;
+
+    handle = calloc(1, sizeof(*handle));
+    if (!handle)
+        goto nomem;
+
+    handle->path = strdup(smb_path);
+    if (!handle->path)
+        goto nomem;
+
+    handle->fh = fh;
+    handle->open_flags = open_flags;
+    fi->fh = (uint64_t)(uintptr_t)handle;
+    return 0;
+
+nomem:
+    free(handle);
+    smb2_close(smb2_ctx, fh);
+    return -ENOMEM;
+}
+
+static int smb2fs_open_handle(const char *smb_path,
+                              struct fuse_file_info *fi,
+                              int smb_flags)
+{
+    struct smb2fh *fh;
+
+    if (!smb_path || !fi)
+        return -EINVAL;
+
+    fh = smb2_open(smb2_ctx, smb_path, smb_flags);
+    if (fh == NULL)
+        return smb2fs_errno();
+
+    return smb2fs_set_handle(fi, smb_path, fh, fi->flags);
+}
+
+static const char *smb2fs_share_type_name(uint32_t type)
+{
+    switch (type & 0x00000003) {
+    case SHARE_TYPE_DISKTREE:
+        return "disk";
+    case SHARE_TYPE_PRINTQ:
+        return "printer";
+    case SHARE_TYPE_DEVICE:
+        return "device";
+    case SHARE_TYPE_IPC:
+        return "ipc";
+    default:
+        return "unknown";
+    }
+}
+
+static int smb2fs_should_show_share(const struct srvsvc_SHARE_INFO_1 *info)
+{
+    if (!info)
+        return 0;
+
+    return ((info->type & 0x00000003) != SHARE_TYPE_IPC);
+}
+
+static int smb2fs_list_shares(void)
+{
+    struct srvsvc_NetrShareEnum_rep *rep;
+    struct srvsvc_SHARE_INFO_1_CONTAINER *container;
+    size_t name_width = strlen("Name");
+    size_t type_width = strlen("Type");
+    uint32_t shown = 0;
+    int has_remarks = 0;
+    uint32_t i;
+
+    rep = smb2_share_enum_sync(smb2_ctx, SHARE_INFO_1);
+    if (!rep) {
+        fprintf(stderr, "Share enumeration failed: %s\n", smb2_get_error(smb2_ctx));
+        return 1;
+    }
+
+    container = &rep->ses.ShareInfo.Level1;
+    if (container->EntriesRead > 0 && container->Buffer == NULL) {
+        fprintf(stderr, "Share enumeration returned no data buffer.\n");
+        smb2_free_data(smb2_ctx, rep);
+        return 1;
+    }
+
+    for (i = 0; i < container->EntriesRead; i++) {
+        const struct srvsvc_SHARE_INFO_1 *info = &container->Buffer->share_info_1[i];
+        const char *name = info->netname.utf8 ? info->netname.utf8 : "";
+        const char *type = smb2fs_share_type_name(info->type);
+        const char *remark = info->remark.utf8 ? info->remark.utf8 : "";
+        size_t name_len = strlen(name);
+        size_t type_len = strlen(type);
+
+        if (!smb2fs_should_show_share(info))
+            continue;
+
+        if (name_len > name_width)
+            name_width = name_len;
+        if (type_len > type_width)
+            type_width = type_len;
+        if (remark[0] != '\0')
+            has_remarks = 1;
+        shown++;
+    }
+
+    if (shown == 0) {
+        printf("No browseable shares found.\n");
+        smb2_free_data(smb2_ctx, rep);
+        return 0;
+    }
+
+    if (has_remarks) {
+        printf("%-*s  %-*s  %s\n",
+               (int)name_width, "Name",
+               (int)type_width, "Type",
+               "Remark");
+        printf("%-*s  %-*s  %s\n",
+               (int)name_width, "----",
+               (int)type_width, "----",
+               "------");
+    } else {
+        printf("%-*s  %s\n", (int)name_width, "Name", "Type");
+        printf("%-*s  %s\n", (int)name_width, "----", "----");
+    }
+
+    for (i = 0; i < container->EntriesRead; i++) {
+        const struct srvsvc_SHARE_INFO_1 *info = &container->Buffer->share_info_1[i];
+        const char *name = info->netname.utf8 ? info->netname.utf8 : "";
+        const char *type = smb2fs_share_type_name(info->type);
+        const char *remark = info->remark.utf8 ? info->remark.utf8 : "";
+
+        if (!smb2fs_should_show_share(info))
+            continue;
+
+        if (has_remarks) {
+            printf("%-*s  %-*s  %s\n",
+                   (int)name_width, name,
+                   (int)type_width, type,
+                   remark);
+        } else {
+            printf("%-*s  %s\n",
+                   (int)name_width, name,
+                   type);
         }
-
-        if (*tok != '\0' && !smb2fs_is_smb_option_token(tok)) {
-            size_t tok_len = strlen(tok);
-            if (!first) {
-                out[out_len++] = ',';
-            }
-            memcpy(out + out_len, tok, tok_len);
-            out_len += tok_len;
-            out[out_len] = '\0';
-            first = 0;
-        }
-        tok = next;
     }
 
-    free(in);
-    if (out_len == 0) {
-        free(out);
-        return NULL;
-    }
-    return out;
+    smb2_free_data(smb2_ctx, rep);
+    return 0;
 }
 
 static int smb2fs_prepare_mount_args(struct fuse_args *src, struct fuse_args *dst)
@@ -289,36 +1084,6 @@ static int smb2fs_prepare_mount_args(struct fuse_args *src, struct fuse_args *ds
         if (!arg)
             continue;
 
-        if (strcmp(arg, "-o") == 0 && (i + 1) < src->argc) {
-            char *filtered = smb2fs_filter_mount_optlist(src->argv[i + 1]);
-            if (filtered) {
-                if (fuse_opt_add_arg(dst, "-o") < 0 ||
-                    fuse_opt_add_arg(dst, filtered) < 0) {
-                    free(filtered);
-                    return -1;
-                }
-                free(filtered);
-            }
-            i++;
-            continue;
-        }
-
-        if (arg[0] == '-' && arg[1] == 'o' && arg[2] != '\0') {
-            char *filtered = smb2fs_filter_mount_optlist(arg + 2);
-            if (filtered) {
-                if (fuse_opt_add_arg(dst, "-o") < 0 ||
-                    fuse_opt_add_arg(dst, filtered) < 0) {
-                    free(filtered);
-                    return -1;
-                }
-                free(filtered);
-            }
-            continue;
-        }
-
-        if (smb2fs_is_smb_option_token(arg))
-            continue;
-
         if (fuse_opt_add_arg(dst, arg) < 0)
             return -1;
     }
@@ -329,21 +1094,35 @@ static int smb2fs_prepare_mount_args(struct fuse_args *src, struct fuse_args *ds
         fuse_opt_add_arg(dst, "defer_permissions") < 0) {
         return -1;
     }
+
+    /* Append volname= for the Finder-visible volume label */
+    {
+        const char *vname = cfg.volname ? cfg.volname : cfg.share;
+
+        if (!vname)
+            return -1;
+        if (smb2fs_add_generated_keyval_opt(dst, "volname", vname) < 0)
+            return -1;
+    }
+
+    /* Append fsname=//server/share for mount identity */
+    {
+        char *fsname_value;
+
+        if (!cfg.server || !cfg.share)
+            return -1;
+        fsname_value = smb2fs_join_unc_path(cfg.server, cfg.share);
+        if (!fsname_value)
+            return -1;
+        if (smb2fs_add_generated_keyval_opt(dst, "fsname", fsname_value) < 0) {
+            free(fsname_value);
+            return -1;
+        }
+        free(fsname_value);
+    }
+
     return 0;
 }
-
-#define SMB2FS_OPT(t, p) { t, offsetof(struct smb2fs_config, p), 1 }
-
-static struct fuse_opt smb2fs_opts[] = {
-    SMB2FS_OPT("server=%s",   server),
-    SMB2FS_OPT("share=%s",    share),
-    SMB2FS_OPT("user=%s",     user),
-    SMB2FS_OPT("password=%s", password),
-    SMB2FS_OPT("passfd=%d",   passfd),
-    SMB2FS_OPT("password_prompt", password_prompt),
-    SMB2FS_OPT("domain=%s",   domain),
-    FUSE_OPT_END
-};
 
 /* Convert smb2_stat_64 to struct stat */
 static void smb2stat_to_stat(const struct smb2_stat_64 *s2, struct stat *st)
@@ -356,6 +1135,8 @@ static void smb2stat_to_stat(const struct smb2_stat_64 *s2, struct stat *st)
         st->st_mode  = S_IFREG | 0644;
         st->st_nlink = 1;
     }
+    st->st_uid   = getuid();
+    st->st_gid   = getgid();
     st->st_size  = (off_t)s2->smb2_size;
     st->st_atime = (time_t)s2->smb2_atime;
     st->st_mtime = (time_t)s2->smb2_mtime;
@@ -382,11 +1163,14 @@ static uint32_t smb2fs_io_size(size_t size)
 static int smb2fs_getattr(const char *path, struct stat *stbuf)
 {
     const char *smb_path;
+    int rc;
 
     if (strcmp(path, "/") == 0) {
         memset(stbuf, 0, sizeof(*stbuf));
         stbuf->st_mode  = S_IFDIR | 0755;
         stbuf->st_nlink = 2;
+        stbuf->st_uid   = getuid();
+        stbuf->st_gid   = getgid();
         return 0;
     }
 
@@ -395,8 +1179,9 @@ static int smb2fs_getattr(const char *path, struct stat *stbuf)
         return -EINVAL;
 
     struct smb2_stat_64 st;
-    if (smb2_stat(smb2_ctx, smb_path, &st) < 0)
-        return smb2fs_errno();
+    rc = smb2_stat(smb2_ctx, smb_path, &st);
+    if (rc < 0)
+        return rc;
 
     smb2stat_to_stat(&st, stbuf);
     return 0;
@@ -423,6 +1208,8 @@ static int smb2fs_readdir(const char *path, void *buf, fuse_fill_dir_t filler,
     struct smb2dirent *ent;
     while ((ent = smb2_readdir(smb2_ctx, dir)) != NULL) {
         struct stat st;
+        if (strcmp(ent->name, ".") == 0 || strcmp(ent->name, "..") == 0)
+            continue;
         smb2stat_to_stat(&ent->st, &st);
         if (filler(buf, ent->name, &st, 0) != 0)
             break;
@@ -435,23 +1222,13 @@ static int smb2fs_readdir(const char *path, void *buf, fuse_fill_dir_t filler,
 static int smb2fs_open(const char *path, struct fuse_file_info *fi)
 {
     const char *smb_path = smb2path(path);
-    int flags = 0;
+    int flags;
 
     if (!smb_path)
         return -EINVAL;
 
-    switch (fi->flags & O_ACCMODE) {
-        case O_RDONLY: flags = O_RDONLY; break;
-        case O_WRONLY: flags = O_WRONLY; break;
-        default:       flags = O_RDWR;   break;
-    }
-
-    struct smb2fh *fh = smb2_open(smb2_ctx, smb_path, flags);
-    if (fh == NULL)
-        return smb2fs_errno();
-
-    fi->fh = (uint64_t)(uintptr_t)fh;
-    return 0;
+    flags = smb2fs_supported_open_flags(fi->flags, O_RDONLY, 0);
+    return smb2fs_open_handle(smb_path, fi, flags);
 }
 
 static int smb2fs_create(const char *path, mode_t mode, struct fuse_file_info *fi)
@@ -459,78 +1236,94 @@ static int smb2fs_create(const char *path, mode_t mode, struct fuse_file_info *f
     const char *smb_path = smb2path(path);
     int flags;
 
+    (void)mode;
+
     if (!smb_path)
         return -EINVAL;
 
-    flags = fi ? (fi->flags & O_ACCMODE) : O_WRONLY;
-    if (flags != O_RDONLY && flags != O_WRONLY && flags != O_RDWR)
-        flags = O_WRONLY;
-    if ((mode & 0222) == 0)
-        flags = O_RDONLY;
+    if (!fi)
+        return -EINVAL;
 
-    struct smb2fh *fh = smb2_open(smb2_ctx, smb_path,
-                                   O_CREAT | O_TRUNC | flags);
-    if (fh == NULL)
-        return smb2fs_errno();
-
-    fi->fh = (uint64_t)(uintptr_t)fh;
-    return 0;
+    flags = smb2fs_supported_open_flags(fi->flags, O_WRONLY, 1);
+    return smb2fs_open_handle(smb_path, fi, flags);
 }
 
 static int smb2fs_read(const char *path, char *buf, size_t size, off_t offset,
                        struct fuse_file_info *fi)
 {
     uint32_t io_size;
+    struct smb2fs_handle *handle;
+    int ret;
     (void)path;
     if (offset < 0)
         return -EINVAL;
     if (size == 0)
         return 0;
-    if (!fi || fi->fh == 0)
+    handle = smb2fs_handle_from_fi(fi);
+    if (!handle)
         return -EBADF;
 
-    struct smb2fh *fh = (struct smb2fh *)(uintptr_t)fi->fh;
     io_size = smb2fs_io_size(size);
 
-    if (smb2_lseek(smb2_ctx, fh, offset, SEEK_SET, NULL) < 0)
-        return smb2fs_errno();
+    ret = smb2_lseek(smb2_ctx, handle->fh, offset, SEEK_SET, NULL);
+    if (ret < 0)
+        return ret;
 
-    int ret = smb2_read(smb2_ctx, fh, (uint8_t *)buf, io_size);
-    return (ret < 0) ? smb2fs_errno() : ret;
+    ret = smb2_read(smb2_ctx, handle->fh, (uint8_t *)buf, io_size);
+    return (ret < 0) ? ret : ret;
 }
 
 static int smb2fs_write(const char *path, const char *buf, size_t size,
                         off_t offset, struct fuse_file_info *fi)
 {
     uint32_t io_size;
+    struct smb2fs_handle *handle;
+    struct smb2_stat_64 st;
+    off_t write_offset;
+    int ret;
     (void)path;
-    if (offset < 0)
-        return -EINVAL;
     if (size == 0)
         return 0;
-    if (!fi || fi->fh == 0)
+    handle = smb2fs_handle_from_fi(fi);
+    if (!handle)
         return -EBADF;
 
-    struct smb2fh *fh = (struct smb2fh *)(uintptr_t)fi->fh;
     io_size = smb2fs_io_size(size);
 
-    if (smb2_lseek(smb2_ctx, fh, offset, SEEK_SET, NULL) < 0)
-        return smb2fs_errno();
+    if (handle->open_flags & O_APPEND) {
+        ret = smb2_stat(smb2_ctx, handle->path, &st);
+        if (ret < 0)
+            return ret;
+        write_offset = (off_t)st.smb2_size;
+    } else {
+        if (offset < 0)
+            return -EINVAL;
+        write_offset = offset;
+    }
 
-    int ret = smb2_write(smb2_ctx, fh, (const uint8_t *)buf, io_size);
-    return (ret < 0) ? smb2fs_errno() : ret;
+    ret = smb2_lseek(smb2_ctx, handle->fh, write_offset, SEEK_SET, NULL);
+    if (ret < 0)
+        return ret;
+
+    ret = smb2_write(smb2_ctx, handle->fh, (const uint8_t *)buf, io_size);
+    return (ret < 0) ? ret : ret;
 }
 
 static int smb2fs_release(const char *path, struct fuse_file_info *fi)
 {
+    struct smb2fs_handle *handle;
+    int ret;
+
     (void)path;
-    if (!fi || fi->fh == 0)
+    handle = smb2fs_handle_from_fi(fi);
+    if (!handle)
         return -EBADF;
 
-    struct smb2fh *fh = (struct smb2fh *)(uintptr_t)fi->fh;
-    int ret = smb2_close(smb2_ctx, fh);
+    ret = smb2_close(smb2_ctx, handle->fh);
+    free(handle->path);
+    free(handle);
     fi->fh = 0;
-    return (ret < 0) ? smb2fs_errno() : 0;
+    return smb2fs_result(ret);
 }
 
 static int smb2fs_truncate(const char *path, off_t size)
@@ -539,9 +1332,7 @@ static int smb2fs_truncate(const char *path, off_t size)
     if (!smb_path || size < 0)
         return -EINVAL;
 
-    if (smb2_truncate(smb2_ctx, smb_path, (uint64_t)size) < 0)
-        return smb2fs_errno();
-    return 0;
+    return smb2fs_result(smb2_truncate(smb2_ctx, smb_path, (uint64_t)size));
 }
 
 static int smb2fs_unlink(const char *path)
@@ -550,9 +1341,7 @@ static int smb2fs_unlink(const char *path)
     if (!smb_path)
         return -EINVAL;
 
-    if (smb2_unlink(smb2_ctx, smb_path) < 0)
-        return smb2fs_errno();
-    return 0;
+    return smb2fs_result(smb2_unlink(smb2_ctx, smb_path));
 }
 
 static int smb2fs_mkdir(const char *path, mode_t mode)
@@ -562,9 +1351,7 @@ static int smb2fs_mkdir(const char *path, mode_t mode)
     if (!smb_path)
         return -EINVAL;
 
-    if (smb2_mkdir(smb2_ctx, smb_path) < 0)
-        return smb2fs_errno();
-    return 0;
+    return smb2fs_result(smb2_mkdir(smb2_ctx, smb_path));
 }
 
 static int smb2fs_rmdir(const char *path)
@@ -573,9 +1360,7 @@ static int smb2fs_rmdir(const char *path)
     if (!smb_path)
         return -EINVAL;
 
-    if (smb2_rmdir(smb2_ctx, smb_path) < 0)
-        return smb2fs_errno();
-    return 0;
+    return smb2fs_result(smb2_rmdir(smb2_ctx, smb_path));
 }
 
 static int smb2fs_rename(const char *from, const char *to)
@@ -585,17 +1370,16 @@ static int smb2fs_rename(const char *from, const char *to)
     if (!smb_from || !smb_to)
         return -EINVAL;
 
-    if (smb2_rename(smb2_ctx, smb_from, smb_to) < 0)
-        return smb2fs_errno();
-    return 0;
+    return smb2fs_result(smb2_rename(smb2_ctx, smb_from, smb_to));
 }
 
 static int smb2fs_statfs(const char *path, struct statvfs *stv)
 {
     (void)path;
     struct smb2_statvfs s2stv;
-    if (smb2_statvfs(smb2_ctx, "", &s2stv) < 0)
-        return smb2fs_errno();
+    int rc = smb2_statvfs(smb2_ctx, "", &s2stv);
+    if (rc < 0)
+        return rc;
 
     memset(stv, 0, sizeof(*stv));
     stv->f_bsize   = s2stv.f_bsize;
@@ -626,28 +1410,56 @@ static struct fuse_operations smb2fs_ops = {
 int main(int argc, char *argv[])
 {
     int connected = 0;
+    int help_requested = 0;
+    int password_from_argv = 0;
     int pw_sources = 0;
+    int ret = 1;
+    int auto_mountpoint_created = 0;
+    int auto_mount_parent_created = 0;
+    char *auto_mountpoint = NULL;
+    char *auto_mount_parent = NULL;
     char *runtime_password = NULL;
-    struct fuse_args raw_args = FUSE_ARGS_INIT(argc, argv);
-    struct fuse_args args = FUSE_ARGS_INIT(argc, argv);
+    struct fuse_args raw_args = FUSE_ARGS_INIT(0, NULL);
     struct fuse_args mount_args = FUSE_ARGS_INIT(0, NULL);
 
-    if (fuse_opt_parse(&args, &cfg, smb2fs_opts, NULL) < 0)
-    {
-        fuse_opt_free_args(&args);
-        smb2fs_free_config();
-        return 1;
+    if (smb2fs_parse_cli_args(argc, argv, &raw_args, &help_requested) < 0) {
+        fprintf(stderr,
+                "Invalid command line. Use --server/--share/--user style options;\n"
+                "legacy SMB options inside -o are no longer supported.\n\n");
+        smb2fs_print_usage(stderr, argv[0]);
+        goto out;
     }
-    scrub_password_argv(&args);
+
+    if (help_requested) {
+        smb2fs_print_usage(stdout, argv[0]);
+        ret = 0;
+        goto out;
+    }
+
     scrub_password_argv(&raw_args);
 
-    if (!cfg.server || !cfg.share || !cfg.user) {
-        fprintf(stderr,
-            "Usage: %s <mountpoint> -o server=HOST,share=SHARE,user=USER[,password=PASS|passfd=FD|password_prompt][,domain=DOMAIN]\n",
-            argv[0]);
-        fuse_opt_free_args(&args);
-        smb2fs_free_config();
-        return 1;
+    if (!cfg.server || (!cfg.list_shares && !cfg.share)) {
+        smb2fs_print_usage(stderr, argv[0]);
+        goto out;
+    }
+
+    /* Auto-create mountpoint directory from share name if none was supplied. */
+    if (!cfg.list_shares && !smb2fs_has_mountpoint(&raw_args)) {
+        if (smb2fs_prepare_auto_mountpoint(cfg.share,
+                                           &auto_mountpoint,
+                                           &auto_mountpoint_created,
+                                           &auto_mount_parent,
+                                           &auto_mount_parent_created) < 0) {
+            fprintf(stderr, "Failed to create automatic mountpoint for '%s': %s\n",
+                    cfg.share, strerror(errno));
+            goto out;
+        }
+
+        fprintf(stderr, "Using '%s' as mountpoint.\n", auto_mountpoint);
+        if (fuse_opt_insert_arg(&raw_args, 1, auto_mountpoint) < 0) {
+            fprintf(stderr, "Failed to insert mountpoint into args\n");
+            goto out;
+        }
     }
 
     if (cfg.password)
@@ -656,27 +1468,28 @@ int main(int argc, char *argv[])
         pw_sources++;
     if (cfg.password_prompt)
         pw_sources++;
+    password_from_argv = (cfg.password != NULL);
+
+    if (pw_sources == 0 && cfg.user) {
+        cfg.password_prompt = 1;
+        pw_sources = 1;
+    }
+
     if (pw_sources > 1) {
         fprintf(stderr,
-            "Choose only one password source: password=, passfd=, or password_prompt\n");
-        fuse_opt_free_args(&args);
-        smb2fs_free_config();
-        return 1;
+            "Choose only one password source: --password, --passfd, or --password-prompt\n");
+        goto out;
     }
     if (cfg.passfd >= 0) {
         if (smb2fs_password_from_fd(cfg.passfd, &runtime_password) != 0) {
             fprintf(stderr, "Failed to read password from passfd=%d\n", cfg.passfd);
-            fuse_opt_free_args(&args);
-            smb2fs_free_config();
-            return 1;
+            goto out;
         }
         cfg.password = runtime_password;
     } else if (cfg.password_prompt) {
         if (smb2fs_password_from_prompt(&runtime_password) != 0) {
             fprintf(stderr, "Failed to read password from prompt\n");
-            fuse_opt_free_args(&args);
-            smb2fs_free_config();
-            return 1;
+            goto out;
         }
         cfg.password = runtime_password;
     }
@@ -684,55 +1497,82 @@ int main(int argc, char *argv[])
     smb2_ctx = smb2_init_context();
     if (!smb2_ctx) {
         fprintf(stderr, "Failed to init smb2 context\n");
-        fuse_opt_free_args(&args);
-        smb2fs_free_config();
-        return 1;
+        goto out;
     }
 
-    smb2_set_user(smb2_ctx, cfg.user);
+    if (cfg.domain) {
+        char *original_domain = strdup(cfg.domain);
+        if (!original_domain) {
+            fprintf(stderr, "Failed to normalize domain name\n");
+            goto out;
+        }
+        if (smb2fs_strip_local_domain_suffix(cfg.domain)) {
+            fprintf(stderr,
+                    "Info: normalized domain '%s' to '%s' for NTLM authentication.\n",
+                    original_domain, cfg.domain);
+        }
+        free(original_domain);
+    }
+
+    if (cfg.user)
+        smb2_set_user(smb2_ctx, cfg.user);
     if (cfg.password)
         smb2_set_password(smb2_ctx, cfg.password);
     if (cfg.domain)
         smb2_set_domain(smb2_ctx, cfg.domain);
 
-    if (smb2_connect_share(smb2_ctx, cfg.server, cfg.share, cfg.user) < 0) {
+    if (password_from_argv) {
+        fprintf(stderr,
+                "Warning: --password may leak into shell history and briefly into process arguments.\n"
+                "Prefer --password-prompt or --passfd.\n");
+    }
+
+    if (smb2_connect_share(smb2_ctx, cfg.server,
+                           cfg.list_shares ? "IPC$" : cfg.share,
+                           cfg.user) < 0) {
         fprintf(stderr, "Connect failed: %s\n", smb2_get_error(smb2_ctx));
-        smb2_destroy_context(smb2_ctx);
-        smb2_ctx = NULL;
-        fuse_opt_free_args(&args);
-        smb2fs_free_config();
-        return 1;
+        goto out;
     }
     connected = 1;
 
     /* Authentication complete — clear the plaintext password from memory */
-    if (cfg.password) {
-        secure_zero(cfg.password, strlen(cfg.password));
-        free(cfg.password);
-        cfg.password = NULL;
+    if (cfg.password)
+        smb2fs_secure_free(&cfg.password, strlen(cfg.password));
+
+    if (cfg.list_shares) {
+        ret = smb2fs_list_shares();
+        goto out;
     }
 
     fprintf(stderr, "Connected to //%s/%s, mounting...\n", cfg.server, cfg.share);
 
     if (smb2fs_prepare_mount_args(&raw_args, &mount_args) < 0) {
-        if (connected)
-            smb2_disconnect_share(smb2_ctx);
-        smb2_destroy_context(smb2_ctx);
-        smb2_ctx = NULL;
-        fuse_opt_free_args(&mount_args);
-        fuse_opt_free_args(&args);
-        smb2fs_free_config();
-        return 1;
+        fprintf(stderr, "Failed to prepare FUSE arguments\n");
+        goto out;
     }
 
-    int ret = fuse_main(mount_args.argc, mount_args.argv, &smb2fs_ops, NULL);
+    ret = fuse_main(mount_args.argc, mount_args.argv, &smb2fs_ops, NULL);
 
-    if (connected)
+    if (ret == 255) {
+        fprintf(stderr,
+                "OSXFUSE mount failed after SMB authentication. "
+                "The FUSE kernel extension may be missing, unloaded, "
+                "or incompatible with the libosxfuse user-space library.\n");
+        fprintf(stderr,
+                "Check the OSXFUSE install and kext state, then retry.\n");
+    }
+
+out:
+    if (connected && smb2_ctx)
         smb2_disconnect_share(smb2_ctx);
-    smb2_destroy_context(smb2_ctx);
-    smb2_ctx = NULL;
+    if (smb2_ctx) {
+        smb2_destroy_context(smb2_ctx);
+        smb2_ctx = NULL;
+    }
     fuse_opt_free_args(&mount_args);
-    fuse_opt_free_args(&args);
+    fuse_opt_free_args(&raw_args);
+    smb2fs_cleanup_auto_mountpoint(&auto_mountpoint, &auto_mountpoint_created,
+                                   &auto_mount_parent, &auto_mount_parent_created);
     smb2fs_free_config();
     return ret;
 }
