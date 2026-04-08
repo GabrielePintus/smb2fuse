@@ -46,6 +46,7 @@
 #include <smb2/smb2-errors.h>
 
 static struct smb2_context *smb2_ctx = NULL;
+static struct fuse_operations smb2fs_ops;
 
 /* Securely zero memory without compiler elision. */
 static void secure_zero(void *ptr, size_t len)
