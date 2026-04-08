@@ -1,6 +1,6 @@
 # Local mounts and build outputs
 remote/
-smb2fs
+cli/smb2fs
 gui/build/
 
 # Local tooling

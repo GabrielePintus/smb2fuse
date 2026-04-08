@@ -754,13 +754,13 @@ static int smb2fs_password_from_prompt(char **password_out)
     return 0;
 }
 
-/* Overwrite password=... segments in argv to reduce command-line exposure. */
-static void scrub_password_argv(struct fuse_args *args)
+/* Overwrite password=... segments in an argv-style vector to reduce exposure. */
+static void smb2fs_scrub_password_vector(int argc, char *argv[])
 {
     int i;
 
-    for (i = 0; i < args->argc; i++) {
-        char *arg = args->argv[i];
+    for (i = 0; i < argc; i++) {
+        char *arg = argv[i];
         char *p;
 
         if (!arg)
@@ -774,6 +774,13 @@ static void scrub_password_argv(struct fuse_args *args)
             p = strstr(p, "password=");
         }
     }
+}
+
+static void smb2fs_scrub_password_fuse_args(struct fuse_args *args)
+{
+    if (!args)
+        return;
+    smb2fs_scrub_password_vector(args->argc, args->argv);
 }
 
 static char *smb2fs_next_opt_token(char *tok, char **next_out)
@@ -935,6 +942,7 @@ static int smb2fs_set_handle(struct fuse_file_info *fi,
     return 0;
 
 nomem:
+    /* Keep ownership simple on partial setup failure: close the SMB handle here. */
     free(handle);
     smb2_close(smb2_ctx, fh);
     return -ENOMEM;
@@ -1124,6 +1132,193 @@ static int smb2fs_prepare_mount_args(struct fuse_args *src, struct fuse_args *ds
     return 0;
 }
 
+static int smb2fs_prepare_runtime_args(int argc, char *argv[],
+                                       struct fuse_args *raw_args,
+                                       int *help_requested,
+                                       char **auto_mountpoint,
+                                       int *auto_mountpoint_created,
+                                       char **auto_mount_parent,
+                                       int *auto_mount_parent_created)
+{
+    if (smb2fs_parse_cli_args(argc, argv, raw_args, help_requested) < 0) {
+        fprintf(stderr,
+                "Invalid command line. Use --server/--share/--user style options;\n"
+                "legacy SMB options inside -o are no longer supported.\n\n");
+        smb2fs_print_usage(stderr, argv[0]);
+        return -1;
+    }
+
+    smb2fs_scrub_password_vector(argc, argv);
+    smb2fs_scrub_password_fuse_args(raw_args);
+
+    if (*help_requested)
+        return 0;
+
+    if (!cfg.server || (!cfg.list_shares && !cfg.share)) {
+        smb2fs_print_usage(stderr, argv[0]);
+        return -1;
+    }
+
+    /* If no mountpoint was passed, choose the standard fallback chain. */
+    if (!cfg.list_shares && !smb2fs_has_mountpoint(raw_args)) {
+        if (smb2fs_prepare_auto_mountpoint(cfg.share,
+                                           auto_mountpoint,
+                                           auto_mountpoint_created,
+                                           auto_mount_parent,
+                                           auto_mount_parent_created) < 0) {
+            fprintf(stderr, "Failed to create automatic mountpoint for '%s': %s\n",
+                    cfg.share, strerror(errno));
+            return -1;
+        }
+
+        fprintf(stderr, "Using '%s' as mountpoint.\n", *auto_mountpoint);
+        if (fuse_opt_insert_arg(raw_args, 1, *auto_mountpoint) < 0) {
+            fprintf(stderr, "Failed to insert mountpoint into args\n");
+            return -1;
+        }
+    }
+
+    return 0;
+}
+
+static int smb2fs_prepare_password(int *password_from_argv_out,
+                                   char **runtime_password_out)
+{
+    int pw_sources = 0;
+    int password_from_argv = 0;
+
+    if (!password_from_argv_out || !runtime_password_out)
+        return -1;
+
+    if (cfg.password)
+        pw_sources++;
+    if (cfg.passfd >= 0)
+        pw_sources++;
+    if (cfg.password_prompt)
+        pw_sources++;
+    password_from_argv = (cfg.password != NULL);
+
+    if (pw_sources == 0 && cfg.user) {
+        cfg.password_prompt = 1;
+        pw_sources = 1;
+    }
+
+    if (pw_sources > 1) {
+        fprintf(stderr,
+                "Choose only one password source: --password, --passfd, or --password-prompt\n");
+        return -1;
+    }
+
+    if (cfg.passfd >= 0) {
+        if (smb2fs_password_from_fd(cfg.passfd, runtime_password_out) != 0) {
+            fprintf(stderr, "Failed to read password from passfd=%d\n", cfg.passfd);
+            return -1;
+        }
+        cfg.password = *runtime_password_out;
+    } else if (cfg.password_prompt) {
+        if (smb2fs_password_from_prompt(runtime_password_out) != 0) {
+            fprintf(stderr, "Failed to read password from prompt\n");
+            return -1;
+        }
+        cfg.password = *runtime_password_out;
+    }
+
+    *password_from_argv_out = password_from_argv;
+    return 0;
+}
+
+static int smb2fs_create_context(void)
+{
+    smb2_ctx = smb2_init_context();
+    if (!smb2_ctx) {
+        fprintf(stderr, "Failed to init smb2 context\n");
+        return -1;
+    }
+    return 0;
+}
+
+static int smb2fs_apply_domain_normalization(void)
+{
+    char *original_domain;
+
+    if (!cfg.domain)
+        return 0;
+
+    original_domain = strdup(cfg.domain);
+    if (!original_domain) {
+        fprintf(stderr, "Failed to normalize domain name\n");
+        return -1;
+    }
+    if (smb2fs_strip_local_domain_suffix(cfg.domain)) {
+        fprintf(stderr,
+                "Info: normalized domain '%s' to '%s' for NTLM authentication.\n",
+                original_domain, cfg.domain);
+    }
+    free(original_domain);
+    return 0;
+}
+
+static void smb2fs_apply_auth_to_context(void)
+{
+    if (cfg.user)
+        smb2_set_user(smb2_ctx, cfg.user);
+    if (cfg.password)
+        smb2_set_password(smb2_ctx, cfg.password);
+    if (cfg.domain)
+        smb2_set_domain(smb2_ctx, cfg.domain);
+}
+
+static int smb2fs_connect(int *connected_out)
+{
+    if (!connected_out)
+        return -1;
+
+    if (smb2_connect_share(smb2_ctx, cfg.server,
+                           cfg.list_shares ? "IPC$" : cfg.share,
+                           cfg.user) < 0) {
+        fprintf(stderr, "Connect failed: %s\n", smb2_get_error(smb2_ctx));
+        return -1;
+    }
+
+    *connected_out = 1;
+    return 0;
+}
+
+static void smb2fs_clear_runtime_password(void)
+{
+    if (cfg.password)
+        smb2fs_secure_free(&cfg.password, strlen(cfg.password));
+}
+
+static int smb2fs_run_connected_mode(struct fuse_args *raw_args,
+                                     struct fuse_args *mount_args)
+{
+    int ret;
+
+    if (cfg.list_shares)
+        return smb2fs_list_shares();
+
+    fprintf(stderr, "Connected to //%s/%s, mounting...\n", cfg.server, cfg.share);
+
+    if (smb2fs_prepare_mount_args(raw_args, mount_args) < 0) {
+        fprintf(stderr, "Failed to prepare FUSE arguments\n");
+        return 1;
+    }
+
+    ret = fuse_main(mount_args->argc, mount_args->argv, &smb2fs_ops, NULL);
+
+    if (ret == 255) {
+        fprintf(stderr,
+                "OSXFUSE mount failed after SMB authentication. "
+                "The FUSE kernel extension may be missing, unloaded, "
+                "or incompatible with the libosxfuse user-space library.\n");
+        fprintf(stderr,
+                "Check the OSXFUSE install and kext state, then retry.\n");
+    }
+
+    return ret;
+}
+
 /* Convert smb2_stat_64 to struct stat */
 static void smb2stat_to_stat(const struct smb2_stat_64 *s2, struct stat *st)
 {
@@ -1291,6 +1486,7 @@ static int smb2fs_write(const char *path, const char *buf, size_t size,
     io_size = smb2fs_io_size(size);
 
     if (handle->open_flags & O_APPEND) {
+        /* Enforce append in user space so writes do not depend on FUSE/kernel quirks. */
         ret = smb2_stat(smb2_ctx, handle->path, &st);
         if (ret < 0)
             return ret;
@@ -1412,7 +1608,6 @@ int main(int argc, char *argv[])
     int connected = 0;
     int help_requested = 0;
     int password_from_argv = 0;
-    int pw_sources = 0;
     int ret = 1;
     int auto_mountpoint_created = 0;
     int auto_mount_parent_created = 0;
@@ -1422,13 +1617,10 @@ int main(int argc, char *argv[])
     struct fuse_args raw_args = FUSE_ARGS_INIT(0, NULL);
     struct fuse_args mount_args = FUSE_ARGS_INIT(0, NULL);
 
-    if (smb2fs_parse_cli_args(argc, argv, &raw_args, &help_requested) < 0) {
-        fprintf(stderr,
-                "Invalid command line. Use --server/--share/--user style options;\n"
-                "legacy SMB options inside -o are no longer supported.\n\n");
-        smb2fs_print_usage(stderr, argv[0]);
+    if (smb2fs_prepare_runtime_args(argc, argv, &raw_args, &help_requested,
+                                    &auto_mountpoint, &auto_mountpoint_created,
+                                    &auto_mount_parent, &auto_mount_parent_created) < 0)
         goto out;
-    }
 
     if (help_requested) {
         smb2fs_print_usage(stdout, argv[0]);
@@ -1436,90 +1628,16 @@ int main(int argc, char *argv[])
         goto out;
     }
 
-    scrub_password_argv(&raw_args);
-
-    if (!cfg.server || (!cfg.list_shares && !cfg.share)) {
-        smb2fs_print_usage(stderr, argv[0]);
+    if (smb2fs_prepare_password(&password_from_argv, &runtime_password) < 0)
         goto out;
-    }
 
-    /* Auto-create mountpoint directory from share name if none was supplied. */
-    if (!cfg.list_shares && !smb2fs_has_mountpoint(&raw_args)) {
-        if (smb2fs_prepare_auto_mountpoint(cfg.share,
-                                           &auto_mountpoint,
-                                           &auto_mountpoint_created,
-                                           &auto_mount_parent,
-                                           &auto_mount_parent_created) < 0) {
-            fprintf(stderr, "Failed to create automatic mountpoint for '%s': %s\n",
-                    cfg.share, strerror(errno));
-            goto out;
-        }
-
-        fprintf(stderr, "Using '%s' as mountpoint.\n", auto_mountpoint);
-        if (fuse_opt_insert_arg(&raw_args, 1, auto_mountpoint) < 0) {
-            fprintf(stderr, "Failed to insert mountpoint into args\n");
-            goto out;
-        }
-    }
-
-    if (cfg.password)
-        pw_sources++;
-    if (cfg.passfd >= 0)
-        pw_sources++;
-    if (cfg.password_prompt)
-        pw_sources++;
-    password_from_argv = (cfg.password != NULL);
-
-    if (pw_sources == 0 && cfg.user) {
-        cfg.password_prompt = 1;
-        pw_sources = 1;
-    }
-
-    if (pw_sources > 1) {
-        fprintf(stderr,
-            "Choose only one password source: --password, --passfd, or --password-prompt\n");
+    if (smb2fs_create_context() < 0)
         goto out;
-    }
-    if (cfg.passfd >= 0) {
-        if (smb2fs_password_from_fd(cfg.passfd, &runtime_password) != 0) {
-            fprintf(stderr, "Failed to read password from passfd=%d\n", cfg.passfd);
-            goto out;
-        }
-        cfg.password = runtime_password;
-    } else if (cfg.password_prompt) {
-        if (smb2fs_password_from_prompt(&runtime_password) != 0) {
-            fprintf(stderr, "Failed to read password from prompt\n");
-            goto out;
-        }
-        cfg.password = runtime_password;
-    }
 
-    smb2_ctx = smb2_init_context();
-    if (!smb2_ctx) {
-        fprintf(stderr, "Failed to init smb2 context\n");
+    if (smb2fs_apply_domain_normalization() < 0)
         goto out;
-    }
 
-    if (cfg.domain) {
-        char *original_domain = strdup(cfg.domain);
-        if (!original_domain) {
-            fprintf(stderr, "Failed to normalize domain name\n");
-            goto out;
-        }
-        if (smb2fs_strip_local_domain_suffix(cfg.domain)) {
-            fprintf(stderr,
-                    "Info: normalized domain '%s' to '%s' for NTLM authentication.\n",
-                    original_domain, cfg.domain);
-        }
-        free(original_domain);
-    }
-
-    if (cfg.user)
-        smb2_set_user(smb2_ctx, cfg.user);
-    if (cfg.password)
-        smb2_set_password(smb2_ctx, cfg.password);
-    if (cfg.domain)
-        smb2_set_domain(smb2_ctx, cfg.domain);
+    smb2fs_apply_auth_to_context();
 
     if (password_from_argv) {
         fprintf(stderr,
@@ -1527,40 +1645,13 @@ int main(int argc, char *argv[])
                 "Prefer --password-prompt or --passfd.\n");
     }
 
-    if (smb2_connect_share(smb2_ctx, cfg.server,
-                           cfg.list_shares ? "IPC$" : cfg.share,
-                           cfg.user) < 0) {
-        fprintf(stderr, "Connect failed: %s\n", smb2_get_error(smb2_ctx));
+    if (smb2fs_connect(&connected) < 0)
         goto out;
-    }
-    connected = 1;
 
     /* Authentication complete — clear the plaintext password from memory */
-    if (cfg.password)
-        smb2fs_secure_free(&cfg.password, strlen(cfg.password));
+    smb2fs_clear_runtime_password();
 
-    if (cfg.list_shares) {
-        ret = smb2fs_list_shares();
-        goto out;
-    }
-
-    fprintf(stderr, "Connected to //%s/%s, mounting...\n", cfg.server, cfg.share);
-
-    if (smb2fs_prepare_mount_args(&raw_args, &mount_args) < 0) {
-        fprintf(stderr, "Failed to prepare FUSE arguments\n");
-        goto out;
-    }
-
-    ret = fuse_main(mount_args.argc, mount_args.argv, &smb2fs_ops, NULL);
-
-    if (ret == 255) {
-        fprintf(stderr,
-                "OSXFUSE mount failed after SMB authentication. "
-                "The FUSE kernel extension may be missing, unloaded, "
-                "or incompatible with the libosxfuse user-space library.\n");
-        fprintf(stderr,
-                "Check the OSXFUSE install and kext state, then retry.\n");
-    }
+    ret = smb2fs_run_connected_mode(&raw_args, &mount_args);
 
 out:
     if (connected && smb2_ctx)

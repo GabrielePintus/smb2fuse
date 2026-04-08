@@ -6,7 +6,7 @@ MACOS_DIR := $(CONTENTS_DIR)/MacOS
 RESOURCES_DIR := $(CONTENTS_DIR)/Resources
 ASSETS_DIR := Assets
 APP_EXECUTABLE := $(MACOS_DIR)/$(APP_NAME)
-CLI_BINARY := ../smb2fs
+CLI_BINARY := ../cli/smb2fs
 ICON_SOURCE := $(ASSETS_DIR)/Icon.png
 ICON_NAME := SMB2FUSE
 ICONSET_DIR := $(BUILD_DIR)/$(ICON_NAME).iconset
@@ -16,7 +16,11 @@ CC ?= clang
 OBJCFLAGS += -fobjc-arc -fblocks -O2 -Wall -Wextra
 FRAMEWORKS += -framework Cocoa -framework Security
 
-SOURCES := main.m SMBAppDelegate.m
+SOURCES := main.m \
+	SMBAppDelegate.m \
+	SMBConnection.m \
+	SMBTaskRunner.m \
+	SMBKeychainStore.m
 OBJECTS := $(patsubst %.m,$(BUILD_DIR)/%.o,$(SOURCES))
 
 .PHONY: all clean
@@ -26,7 +30,7 @@ all: $(APP_BUNDLE)
 $(BUILD_DIR):
 	mkdir -p $(BUILD_DIR)
 
-$(BUILD_DIR)/%.o: %.m SMBAppDelegate.h | $(BUILD_DIR)
+$(BUILD_DIR)/%.o: %.m *.h | $(BUILD_DIR)
 	$(CC) $(OBJCFLAGS) -c $< -o $@
 
 $(APP_EXECUTABLE): $(OBJECTS) | $(BUILD_DIR)

@@ -40,10 +40,10 @@ This is the environment I used. Other configurations may work, but this is what 
 
 ## Repository layout
 
-- `smb2fs.c`: the CLI and FUSE filesystem implementation
-- `Makefile`: root build for the CLI
-- `libsmb2/`: bundled `libsmb2` submodule used by the filesystem
+- `cli/`: the CLI and FUSE filesystem implementation
 - `gui/`: separate native AppKit GUI wrapper built on top of the CLI
+- `Makefile`: top-level build that drives both the CLI and the GUI
+- `libsmb2/`: bundled `libsmb2` submodule used by the filesystem
 
 ---
 
@@ -134,12 +134,12 @@ make
 ```
 
 From the repository root, `make` now builds both:
-- the CLI `smb2fs`
+- the CLI `cli/smb2fs`
 - the GUI app under `gui/build/SMB2FUSE.app`
 
 `_FILE_OFFSET_BITS=64` is required to support files larger than 2 GB. The source now defines it by default, but keeping the compile flag is still recommended for clarity.
 
-The root `Makefile` uses the same flags shown below and defaults to `PREFIX=/usr/local`. If needed, you can override it:
+The root `Makefile` delegates to the CLI build in `cli/` and defaults to `PREFIX=/usr/local`. If needed, you can override it:
 
 ```bash
 make PREFIX=/usr/local
@@ -148,6 +148,7 @@ make PREFIX=/usr/local
 Equivalent build command:
 
 ```bash
+cd cli
 gcc -o smb2fs smb2fs.c \
     -I/usr/local/include/osxfuse/fuse \
     -I/usr/local/include/osxfuse \
@@ -178,7 +179,7 @@ Run `smb2fs` with an explicit mount point:
 
 ```bash
 mkdir ~/mnt
-./smb2fs ~/mnt --server 192.168.1.1 --share MyShare --user alice --domain MYDOMAIN
+./cli/smb2fs ~/mnt --server 192.168.1.1 --share MyShare --user alice --domain MYDOMAIN
 ```
 
 If you omit the mount point, `smb2fs` creates one automatically using this fallback order:
@@ -196,17 +197,17 @@ If you set a user but do not pass any password option, `smb2fs` prompts interact
 To list the shares visible on a host for the current credentials:
 
 ```bash
-./smb2fs --list-shares --server 192.168.1.1 --user alice --domain MYDOMAIN
+./cli/smb2fs --list-shares --server 192.168.1.1 --user alice --domain MYDOMAIN
 ```
 
 For better security, avoid passing `--password ...` on the command line. `--password` remains available as a convenience option, but it can leak into shell history and briefly into process arguments. If you omit all password options and a user is set, `smb2fs` uses the interactive prompt automatically. You can also choose one of these explicitly:
 
 ```bash
 # Interactive prompt (no password in argv/history)
-./smb2fs ~/mnt --server 192.168.1.1 --share MyShare --user alice --password-prompt --domain MYDOMAIN
+./cli/smb2fs ~/mnt --server 192.168.1.1 --share MyShare --user alice --password-prompt --domain MYDOMAIN
 
 # File descriptor (example uses stdin as fd 0)
-printf '%s' 'secret' | ./smb2fs ~/mnt --server 192.168.1.1 --share MyShare --user alice --passfd 0 --domain MYDOMAIN
+printf '%s' 'secret' | ./cli/smb2fs ~/mnt --server 192.168.1.1 --share MyShare --user alice --passfd 0 --domain MYDOMAIN
 ```
 
 | Option     | Required | Description                          |
@@ -242,10 +243,16 @@ umount ~/mnt
 
 A separate native AppKit wrapper lives under [gui/README.md](/home/gabrielepintus/Downloads/smb2fuse/gui/README.md). It is intentionally a thin launcher around the CLI, with saved connections, share listing, mount/unmount actions, optional Keychain-backed password storage, and a small activity log.
 
-Build it separately after the CLI:
+Build it from the repository root with:
 
 ```bash
 make
+```
+
+If you only want the GUI, you can also run:
+
+```bash
+make gui
 ```
 
 The resulting app bundle is:

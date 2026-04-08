@@ -1,13 +1,9 @@
 #import "SMBAppDelegate.h"
+#import "SMBConnection.h"
+#import "SMBKeychainStore.h"
+#import "SMBTaskRunner.h"
 
 #include <arpa/inet.h>
-
-#import <Security/Security.h>
-#import <dispatch/dispatch.h>
-
-#ifndef kSecProtocolTypeSMB
-#define kSecProtocolTypeSMB ((SecProtocolType)'smb ')
-#endif
 
 static NSString *const kSMBBookmarkDefaultsKey = @"Bookmarks";
 static NSString *const kSMBConnectionExchangeFormat = @"smb2fuse-connections";
@@ -21,12 +17,6 @@ static NSInteger const kSMBEditorBrowseSharesTag = 1006;
 static NSInteger const kSMBEditorPasswordStateTag = 1007;
 static NSInteger const kSMBEditorForgetPasswordTag = 1008;
 static NSInteger const kSMBEditorErrorTag = 1099;
-
-typedef enum SMBTaskPurpose {
-    SMBTaskPurposeListShares = 1,
-    SMBTaskPurposeMount = 2,
-    SMBTaskPurposeUnmount = 3
-} SMBTaskPurpose;
 
 @interface SMBHintTextField : NSTextField
 
@@ -154,7 +144,8 @@ typedef enum SMBTaskPurpose {
 @property (strong) NSMenu *bookmarksMenu;
 
 @property (strong) NSMutableArray *bookmarks;
-@property (strong) NSMutableDictionary *mountedBookmarkPaths;
+@property (strong) SMBTaskRunner *taskRunner;
+@property (strong) SMBKeychainStore *keychainStore;
 @property (assign) BOOL taskRunning;
 
 @end
@@ -165,7 +156,8 @@ typedef enum SMBTaskPurpose {
 {
     (void)notification;
     self.bookmarks = [NSMutableArray array];
-    self.mountedBookmarkPaths = [NSMutableDictionary dictionary];
+    self.taskRunner = [[SMBTaskRunner alloc] init];
+    self.keychainStore = [[SMBKeychainStore alloc] init];
 
     [self loadBookmarks];
     [self installMainMenu];
@@ -531,34 +523,15 @@ typedef enum SMBTaskPurpose {
         [cell setIdentifier:@"bookmark-cell"];
     }
 
-    NSDictionary *bookmark = [self.bookmarks objectAtIndex:(NSUInteger)row];
+    SMBConnection *bookmark = [self.bookmarks objectAtIndex:(NSUInteger)row];
     NSString *title = [self bookmarkDisplayName:bookmark];
-    NSString *server = [bookmark objectForKey:@"server"] ?: @"";
-    NSString *share = [bookmark objectForKey:@"share"] ?: @"";
-    NSString *user = [bookmark objectForKey:@"user"] ?: @"Guest";
-    NSString *domain = [bookmark objectForKey:@"domain"] ?: @"";
-    NSString *uuid = [bookmark objectForKey:@"uuid"] ?: @"";
-    NSString *mountpoint = [self.mountedBookmarkPaths objectForKey:uuid];
-    NSString *subtitle = nil;
-    NSString *detail = nil;
+    NSString *mountpoint = bookmark.mountedPath ?: @"";
     NSImage *icon = [NSImage imageNamed:NSImageNameNetwork];
-
-    if ([share length] > 0) {
-        subtitle = [NSString stringWithFormat:@"%@  •  %@", server, share];
-    } else {
-        subtitle = server;
-    }
-
-    if ([domain length] > 0) {
-        detail = [NSString stringWithFormat:@"%@  •  %@", user, domain];
-    } else {
-        detail = user;
-    }
 
     [cell.bookmarkIconView setImage:icon];
     [cell.titleField setStringValue:title];
-    [cell.subtitleField setStringValue:subtitle ?: @""];
-    [cell.detailField setStringValue:detail ?: @""];
+    [cell.subtitleField setStringValue:[bookmark subtitleText] ?: @""];
+    [cell.detailField setStringValue:[bookmark detailText] ?: @""];
     [cell.mountedField setStringValue:[mountpoint length] > 0 ? @"Connected" : @""];
 
     return cell;
@@ -580,24 +553,20 @@ typedef enum SMBTaskPurpose {
 {
     (void)sender;
     NSInteger row = [self selectedBookmarkRow];
-    NSDictionary *bookmark = [self selectedBookmark];
-    NSMutableDictionary *copy = nil;
+    SMBConnection *bookmark = [self selectedBookmark];
+    SMBConnection *copy = nil;
     NSString *originalName = nil;
-    NSString *uuid = nil;
 
     if (!bookmark) {
         [self setStatus:@"Select a connection to duplicate."];
         return;
     }
 
-    copy = [bookmark mutableCopy];
+    copy = [bookmark copy];
     originalName = [self bookmarkDisplayName:bookmark];
-    uuid = [copy objectForKey:@"uuid"];
-    if ([uuid length] > 0) {
-        [self.mountedBookmarkPaths removeObjectForKey:uuid];
-    }
-    [copy setObject:[self generateBookmarkUUID] forKey:@"uuid"];
-    [copy setObject:[NSString stringWithFormat:@"%@ Copy", originalName] forKey:@"name"];
+    copy.uuid = [SMBConnection generatedUUID];
+    copy.name = [NSString stringWithFormat:@"%@ Copy", originalName];
+    copy.mountedPath = nil;
 
     [self.bookmarks insertObject:copy atIndex:(NSUInteger)(row + 1)];
     [self persistBookmarks];
@@ -627,11 +596,8 @@ typedef enum SMBTaskPurpose {
         return;
     }
 
-    NSDictionary *bookmark = [self.bookmarks objectAtIndex:(NSUInteger)row];
-    NSString *uuid = [bookmark objectForKey:@"uuid"];
-    if ([uuid length] > 0) {
-        [self.mountedBookmarkPaths removeObjectForKey:uuid];
-    }
+    SMBConnection *bookmark = [self.bookmarks objectAtIndex:(NSUInteger)row];
+    bookmark.mountedPath = nil;
 
     [self.bookmarks removeObjectAtIndex:(NSUInteger)row];
     [self persistBookmarks];
@@ -648,7 +614,7 @@ typedef enum SMBTaskPurpose {
         return;
     }
 
-    NSDictionary *bookmark = [self selectedBookmark];
+    SMBConnection *bookmark = [self selectedBookmark];
     if (!bookmark) {
         [self setStatus:@"Select a connection to connect."];
         return;
@@ -659,16 +625,21 @@ typedef enum SMBTaskPurpose {
         return;
     }
 
-    NSString *server = [bookmark objectForKey:@"server"] ?: @"";
-    NSString *share = [bookmark objectForKey:@"share"] ?: @"";
-    NSString *user = [bookmark objectForKey:@"user"] ?: @"";
-    NSString *domain = [bookmark objectForKey:@"domain"] ?: @"";
+    NSString *server = bookmark.server ?: @"";
+    NSString *share = bookmark.share ?: @"";
+    NSString *user = bookmark.user ?: @"";
+    NSString *domain = bookmark.domain ?: @"";
+    NSString *executablePath = [self smb2fsExecutablePath];
     NSDictionary *passwordDecision = nil;
     NSString *password = nil;
     BOOL shouldRememberPassword = NO;
 
     if ([server length] == 0 || [share length] == 0) {
         [self setStatus:@"The selected connection needs both server and share."];
+        return;
+    }
+    if ([executablePath length] == 0) {
+        [self setStatus:@"Unable to locate smb2fs. Build the CLI first, then rebuild the app."];
         return;
     }
 
@@ -686,49 +657,34 @@ typedef enum SMBTaskPurpose {
         shouldRememberPassword = [[passwordDecision objectForKey:@"remember"] boolValue];
     }
 
-    NSMutableArray *arguments = [NSMutableArray array];
-    [arguments addObject:@"--server"];
-    [arguments addObject:server];
-    [arguments addObject:@"--share"];
-    [arguments addObject:share];
-    [self appendOptionalFlag:@"--user" value:user toArguments:arguments];
-    [self appendOptionalFlag:@"--domain" value:domain toArguments:arguments];
-
-    if ([user length] > 0) {
-        [arguments addObject:@"--passfd"];
-        [arguments addObject:@"0"];
-    }
+    NSMutableArray *arguments = [self mountArgumentsForConnection:bookmark];
 
     [self setControlsEnabled:NO];
     [self setStatus:[NSString stringWithFormat:@"Connecting to %@...", [self bookmarkDisplayName:bookmark]]];
-    [self runCommandAtPath:[self smb2fsExecutablePath]
-                 arguments:arguments
-                  password:password
-                   purpose:SMBTaskPurposeMount
-                completion:^(int status, NSString *output) {
+    [self.taskRunner runCommandAtPath:executablePath
+                            arguments:arguments
+                          stdinString:password
+                           completion:^(int status, NSString *output) {
         [self setControlsEnabled:YES];
 
         if (status == 0) {
-            NSString *uuid = [bookmark objectForKey:@"uuid"];
             NSString *mountpoint = [self mountpointFromOutput:output];
             NSString *mountStatus = nil;
             if ([mountpoint length] == 0) {
                 mountpoint = [self bestGuessMountpointForBookmark:bookmark];
             }
-            if ([uuid length] > 0 && [mountpoint length] > 0) {
-                [self.mountedBookmarkPaths setObject:mountpoint forKey:uuid];
-            }
+            bookmark.mountedPath = [mountpoint length] > 0 ? mountpoint : nil;
             [self reloadBookmarkList];
             mountStatus = [NSString stringWithFormat:@"Mounted %@%@%@.",
                            [self bookmarkDisplayName:bookmark],
                            [mountpoint length] > 0 ? @" at " : @"",
                            [mountpoint length] > 0 ? mountpoint : @""];
             if (shouldRememberPassword) {
-                OSStatus saveStatus = [self storePasswordInKeychain:password server:server user:user domain:domain];
+                OSStatus saveStatus = [self.keychainStore storePassword:password server:server user:user domain:domain];
                 if (saveStatus != errSecSuccess) {
                     [self showTextPanelWithTitle:@"Keychain Save Failed"
                                             text:[NSString stringWithFormat:@"The connection succeeded, but the password could not be saved in the Mac keychain.\n\n%@",
-                                                  [self securityErrorStringForStatus:saveStatus]]];
+                                                  [self.keychainStore errorStringForStatus:saveStatus]]];
                     mountStatus = [mountStatus stringByAppendingString:@" Password was not saved."];
                 }
             }
@@ -749,7 +705,7 @@ typedef enum SMBTaskPurpose {
         return;
     }
 
-    NSDictionary *bookmark = [self selectedBookmark];
+    SMBConnection *bookmark = [self selectedBookmark];
     if (!bookmark) {
         [self setStatus:@"Select a connection to disconnect."];
         return;
@@ -771,18 +727,14 @@ typedef enum SMBTaskPurpose {
 
     [self setControlsEnabled:NO];
     [self setStatus:[NSString stringWithFormat:@"Disconnecting %@...", [self bookmarkDisplayName:bookmark]]];
-    [self runCommandAtPath:@"/sbin/umount"
-                 arguments:[NSArray arrayWithObject:mountpoint]
-                  password:nil
-                   purpose:SMBTaskPurposeUnmount
-                completion:^(int status, NSString *output) {
+    [self.taskRunner runCommandAtPath:@"/sbin/umount"
+                            arguments:[NSArray arrayWithObject:mountpoint]
+                          stdinString:nil
+                           completion:^(int status, NSString *output) {
         [self setControlsEnabled:YES];
 
         if (status == 0) {
-            NSString *uuid = [bookmark objectForKey:@"uuid"];
-            if ([uuid length] > 0) {
-                [self.mountedBookmarkPaths removeObjectForKey:uuid];
-            }
+            bookmark.mountedPath = nil;
             [self reloadBookmarkList];
             [self setStatus:@"Disconnected."];
         } else {
@@ -801,21 +753,26 @@ typedef enum SMBTaskPurpose {
         return;
     }
 
-    NSDictionary *bookmark = [self selectedBookmark];
+    SMBConnection *bookmark = [self selectedBookmark];
     if (!bookmark) {
         [self setStatus:@"Select a connection first."];
         return;
     }
 
-    NSString *server = [bookmark objectForKey:@"server"] ?: @"";
-    NSString *user = [bookmark objectForKey:@"user"] ?: @"";
-    NSString *domain = [bookmark objectForKey:@"domain"] ?: @"";
+    NSString *server = bookmark.server ?: @"";
+    NSString *user = bookmark.user ?: @"";
+    NSString *domain = bookmark.domain ?: @"";
+    NSString *executablePath = [self smb2fsExecutablePath];
     NSDictionary *passwordDecision = nil;
     NSString *password = nil;
     BOOL shouldRememberPassword = NO;
 
     if ([server length] == 0) {
         [self setStatus:@"The selected connection needs a server."];
+        return;
+    }
+    if ([executablePath length] == 0) {
+        [self setStatus:@"Unable to locate smb2fs. Build the CLI first, then rebuild the app."];
         return;
     }
 
@@ -833,32 +790,24 @@ typedef enum SMBTaskPurpose {
         shouldRememberPassword = [[passwordDecision objectForKey:@"remember"] boolValue];
     }
 
-    NSMutableArray *arguments = [NSMutableArray arrayWithObjects:@"--list-shares", @"--server", server, nil];
-    [self appendOptionalFlag:@"--user" value:user toArguments:arguments];
-    [self appendOptionalFlag:@"--domain" value:domain toArguments:arguments];
-
-    if ([user length] > 0) {
-        [arguments addObject:@"--passfd"];
-        [arguments addObject:@"0"];
-    }
+    NSMutableArray *arguments = [self listSharesArgumentsForConnection:bookmark];
 
     [self setControlsEnabled:NO];
     [self setStatus:[NSString stringWithFormat:@"Listing shares for %@...", server]];
-    [self runCommandAtPath:[self smb2fsExecutablePath]
-                 arguments:arguments
-                  password:password
-                   purpose:SMBTaskPurposeListShares
-                completion:^(int status, NSString *output) {
+    [self.taskRunner runCommandAtPath:executablePath
+                            arguments:arguments
+                          stdinString:password
+                           completion:^(int status, NSString *output) {
         [self setControlsEnabled:YES];
 
         if (status == 0) {
             NSArray *shares = [self parseShareNamesFromOutput:output];
             if (shouldRememberPassword) {
-                OSStatus saveStatus = [self storePasswordInKeychain:password server:server user:user domain:domain];
+                OSStatus saveStatus = [self.keychainStore storePassword:password server:server user:user domain:domain];
                 if (saveStatus != errSecSuccess) {
                     [self showTextPanelWithTitle:@"Keychain Save Failed"
                                             text:[NSString stringWithFormat:@"The share listing succeeded, but the password could not be saved in the Mac keychain.\n\n%@",
-                                                  [self securityErrorStringForStatus:saveStatus]]];
+                                                  [self.keychainStore errorStringForStatus:saveStatus]]];
                 }
             }
             if ([shares count] == 0) {
@@ -879,7 +828,7 @@ typedef enum SMBTaskPurpose {
     (void)sender;
     [self refreshMountedBookmarkPathsFromSystem];
 
-    NSDictionary *bookmark = [self selectedBookmark];
+    SMBConnection *bookmark = [self selectedBookmark];
     if (!bookmark) {
         [self setStatus:@"Select a connection first."];
         return;
@@ -896,7 +845,7 @@ typedef enum SMBTaskPurpose {
 {
     (void)sender;
     [self refreshMountedBookmarkPathsFromSystem];
-    NSDictionary *bookmark = [self selectedBookmark];
+    SMBConnection *bookmark = [self selectedBookmark];
 
     if (!bookmark) {
         [self setStatus:@"Select a connection first."];
@@ -910,7 +859,7 @@ typedef enum SMBTaskPurpose {
 {
     (void)sender;
     [self refreshMountedBookmarkPathsFromSystem];
-    NSDictionary *bookmark = [self selectedBookmark];
+    SMBConnection *bookmark = [self selectedBookmark];
     NSString *mountpoint = nil;
 
     if (!bookmark) {
@@ -989,7 +938,7 @@ typedef enum SMBTaskPurpose {
     int status = -1;
 
     (void)sender;
-    output = [self outputForCommandAtPath:path arguments:[NSArray arrayWithObject:@"--help"] terminationStatus:&status];
+    output = [self.taskRunner outputForCommandAtPath:path arguments:[NSArray arrayWithObject:@"--help"] terminationStatus:&status];
     if (status != 0 || [output length] == 0) {
         output = @"Usage: smb2fs [mountpoint] --server HOST --share SHARE [--user USER]\n       [--password PASS | --passfd FD | --password-prompt]\n       [--domain DOMAIN] [--volname NAME] [FUSE options]\n\nKey options:\n  --list-shares\n  --server HOST\n  --share SHARE\n  --user USER\n  --domain DOMAIN\n  --volname NAME\n  --help";
     }
@@ -1044,7 +993,7 @@ typedef enum SMBTaskPurpose {
 
     connections = [document objectForKey:@"connections"];
     for (NSDictionary *entry in connections) {
-        NSDictionary *bookmark = [self normalizedImportedBookmarkFromDictionary:entry issues:issues];
+        SMBConnection *bookmark = [self normalizedImportedBookmarkFromDictionary:entry issues:issues];
         if (bookmark) {
             [normalized addObject:bookmark];
         }
@@ -1062,7 +1011,7 @@ typedef enum SMBTaskPurpose {
     if ([normalized count] > 1) {
         NSInteger choice = [self importChoiceForConnectionNames:[normalized valueForKey:@"name"]];
         if (choice == NSAlertSecondButtonReturn) {
-            NSDictionary *selected = [self chooseImportedConnectionFromArray:normalized];
+            SMBConnection *selected = [self chooseImportedConnectionFromArray:normalized];
             if (!selected) {
                 [self setStatus:@"Import cancelled."];
                 return;
@@ -1075,8 +1024,8 @@ typedef enum SMBTaskPurpose {
         }
     }
 
-    for (NSDictionary *bookmark in normalized) {
-        [self.bookmarks addObject:[bookmark mutableCopy]];
+    for (SMBConnection *bookmark in normalized) {
+        [self.bookmarks addObject:bookmark];
     }
     importCount = [normalized count];
 
@@ -1102,7 +1051,7 @@ typedef enum SMBTaskPurpose {
 
 - (IBAction)exportSelectedBookmark:(id)sender
 {
-    NSDictionary *bookmark = nil;
+    SMBConnection *bookmark = nil;
 
     (void)sender;
     if (self.taskRunning) {
@@ -1162,9 +1111,9 @@ typedef enum SMBTaskPurpose {
     [self.window performClose:nil];
 }
 
-- (void)openEditorForBookmark:(NSDictionary *)bookmark atIndex:(NSInteger)index
+- (void)openEditorForBookmark:(SMBConnection *)bookmark atIndex:(NSInteger)index
 {
-    NSDictionary *source = bookmark ?: [NSDictionary dictionary];
+    SMBConnection *source = bookmark ?: [[SMBConnection alloc] init];
     NSPanel *panel = [[NSPanel alloc] initWithContentRect:NSMakeRect(0.0, 0.0, 390.0, 286.0)
                                                 styleMask:(NSTitledWindowMask | NSClosableWindowMask)
                                                   backing:NSBackingStoreBuffered
@@ -1174,11 +1123,11 @@ typedef enum SMBTaskPurpose {
     [panel setTitle:index >= 0 ? @"Edit Connection" : @"New Connection"];
     [panel center];
 
-    [self editorFieldInView:contentView title:@"Name" y:208.0 value:[source objectForKey:@"name"] hint:@"Office NAS" tag:kSMBEditorNameTag];
-    [self editorFieldInView:contentView title:@"Server" y:174.0 value:[source objectForKey:@"server"] hint:@"server.local or 192.168.1.52" tag:kSMBEditorServerTag];
-    [self editorFieldInView:contentView title:@"User" y:140.0 value:[source objectForKey:@"user"] hint:@"Optional username" tag:kSMBEditorUserTag];
-    [self editorShareFieldInView:contentView y:106.0 value:[source objectForKey:@"share"] hint:@"SharedFolder"];
-    [self editorFieldInView:contentView title:@"Domain" y:72.0 value:[source objectForKey:@"domain"] hint:@"Optional domain" tag:kSMBEditorDomainTag];
+    [self editorFieldInView:contentView title:@"Name" y:208.0 value:source.name hint:@"Office NAS" tag:kSMBEditorNameTag];
+    [self editorFieldInView:contentView title:@"Server" y:174.0 value:source.server hint:@"server.local or 192.168.1.52" tag:kSMBEditorServerTag];
+    [self editorFieldInView:contentView title:@"User" y:140.0 value:source.user hint:@"Optional username" tag:kSMBEditorUserTag];
+    [self editorShareFieldInView:contentView y:106.0 value:source.share hint:@"SharedFolder"];
+    [self editorFieldInView:contentView title:@"Domain" y:72.0 value:source.domain hint:@"Optional domain" tag:kSMBEditorDomainTag];
 
     NSTextField *passwordState = [self labelWithString:@""
                                                  frame:NSMakeRect(18.0, 56.0, 220.0, 16.0)
@@ -1233,21 +1182,19 @@ typedef enum SMBTaskPurpose {
         return;
     }
 
-    NSMutableDictionary *updated = [NSMutableDictionary dictionary];
-    [self setDictionary:updated value:[self editorValueForTag:kSMBEditorNameTag inWindow:panel] forKey:@"name"];
-    [self setDictionary:updated value:[self editorValueForTag:kSMBEditorServerTag inWindow:panel] forKey:@"server"];
-    [self setDictionary:updated value:[self editorValueForTag:kSMBEditorShareTag inWindow:panel] forKey:@"share"];
-    [self setDictionary:updated value:[self editorValueForTag:kSMBEditorUserTag inWindow:panel] forKey:@"user"];
-    [self setDictionary:updated value:[self editorValueForTag:kSMBEditorDomainTag inWindow:panel] forKey:@"domain"];
+    SMBConnection *updated = [[SMBConnection alloc] init];
+    updated.name = [self editorValueForTag:kSMBEditorNameTag inWindow:panel];
+    updated.server = [self editorValueForTag:kSMBEditorServerTag inWindow:panel];
+    updated.share = [self editorValueForTag:kSMBEditorShareTag inWindow:panel];
+    updated.user = [self editorValueForTag:kSMBEditorUserTag inWindow:panel];
+    updated.domain = [self editorValueForTag:kSMBEditorDomainTag inWindow:panel];
 
     if (index >= 0) {
-        NSString *uuid = [source objectForKey:@"uuid"];
-        if ([uuid length] > 0) {
-            [updated setObject:uuid forKey:@"uuid"];
-        }
+        updated.uuid = source.uuid;
+        updated.mountedPath = source.mountedPath;
         [self.bookmarks replaceObjectAtIndex:(NSUInteger)index withObject:updated];
     } else {
-        [updated setObject:[self generateBookmarkUUID] forKey:@"uuid"];
+        updated.uuid = [SMBConnection generatedUUID];
         [self.bookmarks addObject:updated];
     }
 
@@ -1308,6 +1255,7 @@ typedef enum SMBTaskPurpose {
     NSString *server = [self trimmedString:[serverField stringValue]];
     NSString *user = [self trimmedString:[userField stringValue]];
     NSString *domain = [self trimmedString:[domainField stringValue]];
+    NSString *executablePath = [self smb2fsExecutablePath];
     NSDictionary *passwordDecision = nil;
     NSString *password = nil;
     BOOL shouldRememberPassword = NO;
@@ -1332,6 +1280,11 @@ typedef enum SMBTaskPurpose {
     [self setEditorField:serverField invalid:NO];
     [errorLabel setStringValue:@""];
 
+    if ([executablePath length] == 0) {
+        [errorLabel setStringValue:@"smb2fs is not available. Build the CLI first, then rebuild the app."];
+        return;
+    }
+
     if ([user length] > 0) {
         passwordDecision = [self preparedPasswordDecisionForServer:server
                                                               user:user
@@ -1346,18 +1299,12 @@ typedef enum SMBTaskPurpose {
         shouldRememberPassword = [[passwordDecision objectForKey:@"remember"] boolValue];
     }
 
-    arguments = [NSMutableArray arrayWithObjects:@"--list-shares", @"--server", server, nil];
-    [self appendOptionalFlag:@"--user" value:user toArguments:arguments];
-    [self appendOptionalFlag:@"--domain" value:domain toArguments:arguments];
-    if ([user length] > 0) {
-        [arguments addObject:@"--passfd"];
-        [arguments addObject:@"0"];
-    }
+    arguments = [self listSharesArgumentsForServer:server user:user domain:domain];
 
-    output = [self outputForCommandAtPath:[self smb2fsExecutablePath]
-                                arguments:arguments
-                                 password:password
-                        terminationStatus:&status];
+    output = [self.taskRunner outputForCommandAtPath:executablePath
+                                           arguments:arguments
+                                         stdinString:password
+                                   terminationStatus:&status];
     if (status != 0) {
         [self showTextPanelWithTitle:@"Share Listing Failed" text:output];
         [errorLabel setStringValue:@"Could not list shares for that server."];
@@ -1365,11 +1312,11 @@ typedef enum SMBTaskPurpose {
     }
 
     if (shouldRememberPassword) {
-        OSStatus saveStatus = [self storePasswordInKeychain:password server:server user:user domain:domain];
+        OSStatus saveStatus = [self.keychainStore storePassword:password server:server user:user domain:domain];
         if (saveStatus != errSecSuccess) {
             [self showTextPanelWithTitle:@"Keychain Save Failed"
                                     text:[NSString stringWithFormat:@"The share listing succeeded, but the password could not be saved in the Mac keychain.\n\n%@",
-                                          [self securityErrorStringForStatus:saveStatus]]];
+                                          [self.keychainStore errorStringForStatus:saveStatus]]];
         }
     }
 
@@ -1440,10 +1387,10 @@ typedef enum SMBTaskPurpose {
         return;
     }
 
-    status = [self deletePasswordFromKeychainForServer:server user:user domain:domain];
+    status = [self.keychainStore deletePasswordForServer:server user:user domain:domain];
     if (status != errSecSuccess && status != errSecItemNotFound) {
         [errorLabel setStringValue:[NSString stringWithFormat:@"Could not remove the saved password: %@",
-                                    [self securityErrorStringForStatus:status]]];
+                                    [self.keychainStore errorStringForStatus:status]]];
         return;
     }
 
@@ -1488,7 +1435,7 @@ typedef enum SMBTaskPurpose {
     BOOL hasSavedPassword = NO;
 
     if (validIdentity) {
-        hasSavedPassword = [self hasKeychainPasswordForServer:server user:user domain:domain];
+        hasSavedPassword = [self.keychainStore hasPasswordForServer:server user:user domain:domain];
     }
 
     [forgetButton setEnabled:hasSavedPassword];
@@ -1693,22 +1640,22 @@ typedef enum SMBTaskPurpose {
         return;
     }
 
-    NSDictionary *bookmark = [self.bookmarks objectAtIndex:(NSUInteger)row];
+    SMBConnection *bookmark = [self.bookmarks objectAtIndex:(NSUInteger)row];
     NSTextField *shareField = [[NSTextField alloc] initWithFrame:NSZeroRect];
     NSTextField *nameField = [[NSTextField alloc] initWithFrame:NSZeroRect];
-    NSMutableDictionary *updated = nil;
+    SMBConnection *updated = nil;
 
-    [shareField setStringValue:[bookmark objectForKey:@"share"] ?: @""];
-    [nameField setStringValue:[bookmark objectForKey:@"name"] ?: @""];
+    [shareField setStringValue:bookmark.share ?: @""];
+    [nameField setStringValue:bookmark.name ?: @""];
 
     if (![self chooseShareFromArray:shares intoField:shareField nameField:nameField]) {
         [self setStatus:@"Share selection cancelled."];
         return;
     }
 
-    updated = [[self.bookmarks objectAtIndex:(NSUInteger)row] mutableCopy];
-    [updated setObject:[self trimmedString:[shareField stringValue]] forKey:@"share"];
-    [self setDictionary:updated value:[self trimmedString:[nameField stringValue]] forKey:@"name"];
+    updated = [[self.bookmarks objectAtIndex:(NSUInteger)row] copy];
+    updated.share = [self trimmedString:[shareField stringValue]];
+    updated.name = [self trimmedString:[nameField stringValue]];
     [self.bookmarks replaceObjectAtIndex:(NSUInteger)row withObject:updated];
     [self persistBookmarks];
     [self reloadBookmarkList];
@@ -1813,9 +1760,9 @@ typedef enum SMBTaskPurpose {
     return document;
 }
 
-- (NSDictionary *)normalizedImportedBookmarkFromDictionary:(NSDictionary *)dictionary issues:(NSMutableArray *)issues
+- (SMBConnection *)normalizedImportedBookmarkFromDictionary:(NSDictionary *)dictionary issues:(NSMutableArray *)issues
 {
-    NSMutableDictionary *bookmark = [NSMutableDictionary dictionary];
+    SMBConnection *bookmark = [[SMBConnection alloc] init];
     NSString *name = nil;
     NSString *server = nil;
     NSString *share = nil;
@@ -1844,12 +1791,12 @@ typedef enum SMBTaskPurpose {
         return nil;
     }
 
-    [bookmark setObject:[self generateBookmarkUUID] forKey:@"uuid"];
-    [self setDictionary:bookmark value:name forKey:@"name"];
-    [self setDictionary:bookmark value:server forKey:@"server"];
-    [self setDictionary:bookmark value:share forKey:@"share"];
-    [self setDictionary:bookmark value:user forKey:@"user"];
-    [self setDictionary:bookmark value:domain forKey:@"domain"];
+    bookmark.uuid = [SMBConnection generatedUUID];
+    bookmark.name = name;
+    bookmark.server = server;
+    bookmark.share = share;
+    bookmark.user = user;
+    bookmark.domain = domain;
     return bookmark;
 }
 
@@ -1874,16 +1821,16 @@ typedef enum SMBTaskPurpose {
     return [alert runModal];
 }
 
-- (NSDictionary *)chooseImportedConnectionFromArray:(NSArray *)connections
+- (SMBConnection *)chooseImportedConnectionFromArray:(NSArray *)connections
 {
     NSPopUpButton *popup = [[NSPopUpButton alloc] initWithFrame:NSMakeRect(0.0, 0.0, 320.0, 26.0) pullsDown:NO];
     NSAlert *alert = [[NSAlert alloc] init];
     NSUInteger i = 0;
 
     for (i = 0; i < [connections count]; i++) {
-        NSDictionary *bookmark = [connections objectAtIndex:i];
+        SMBConnection *bookmark = [connections objectAtIndex:i];
         NSString *title = [self bookmarkDisplayName:bookmark];
-        NSString *server = [bookmark objectForKey:@"server"] ?: @"";
+        NSString *server = bookmark.server ?: @"";
         if ([server length] > 0) {
             title = [NSString stringWithFormat:@"%@ (%@)", title, server];
         }
@@ -1956,7 +1903,7 @@ typedef enum SMBTaskPurpose {
 {
     NSMutableArray *connections = [NSMutableArray array];
 
-    for (NSDictionary *bookmark in bookmarks) {
+    for (SMBConnection *bookmark in bookmarks) {
         [connections addObject:[self exportRepresentationForBookmark:bookmark]];
     }
 
@@ -1967,91 +1914,9 @@ typedef enum SMBTaskPurpose {
             nil];
 }
 
-- (NSDictionary *)exportRepresentationForBookmark:(NSDictionary *)bookmark
+- (NSDictionary *)exportRepresentationForBookmark:(SMBConnection *)bookmark
 {
-    NSMutableDictionary *connection = [NSMutableDictionary dictionary];
-    [self setDictionary:connection value:[self trimmedStringFromObject:[bookmark objectForKey:@"name"]] forKey:@"name"];
-    [self setDictionary:connection value:[self trimmedStringFromObject:[bookmark objectForKey:@"server"]] forKey:@"server"];
-    [self setDictionary:connection value:[self trimmedStringFromObject:[bookmark objectForKey:@"share"]] forKey:@"share"];
-    [self setDictionary:connection value:[self trimmedStringFromObject:[bookmark objectForKey:@"user"]] forKey:@"user"];
-    [self setDictionary:connection value:[self trimmedStringFromObject:[bookmark objectForKey:@"domain"]] forKey:@"domain"];
-    return connection;
-}
-
-- (void)runCommandAtPath:(NSString *)path
-               arguments:(NSArray *)arguments
-                password:(NSString *)password
-                 purpose:(SMBTaskPurpose)purpose
-              completion:(void (^)(int status, NSString *output))completion
-{
-    if ([path length] == 0) {
-        [self setStatus:@"Unable to locate smb2fs. Build the CLI first, then rebuild the app."];
-        if (completion) {
-            completion(-1, @"");
-        }
-        return;
-    }
-
-    self.taskRunning = YES;
-
-    dispatch_async(dispatch_get_global_queue(DISPATCH_QUEUE_PRIORITY_DEFAULT, 0), ^{
-        NSTask *task = [[NSTask alloc] init];
-        NSPipe *combinedPipe = [NSPipe pipe];
-        NSPipe *inputPipe = nil;
-        int status = -1;
-        NSString *output = @"";
-
-        [task setLaunchPath:path];
-        [task setArguments:arguments];
-        [task setStandardOutput:combinedPipe];
-        [task setStandardError:combinedPipe];
-
-        if (password != nil) {
-            inputPipe = [NSPipe pipe];
-            [task setStandardInput:inputPipe];
-        }
-
-        @try {
-            [task launch];
-
-            if (inputPipe) {
-                NSData *data = [password dataUsingEncoding:NSUTF8StringEncoding];
-                [[inputPipe fileHandleForWriting] writeData:data];
-                [[inputPipe fileHandleForWriting] closeFile];
-            }
-
-            output = [self readOutputFromPipe:combinedPipe];
-            [task waitUntilExit];
-            status = [task terminationStatus];
-        }
-        @catch (NSException *exception) {
-            output = [NSString stringWithFormat:@"Failed to launch task: %@\n", [exception reason]];
-        }
-
-        dispatch_async(dispatch_get_main_queue(), ^{
-            self.taskRunning = NO;
-            if (purpose == SMBTaskPurposeListShares && status != 0) {
-                [self setStatus:@"Share listing failed."];
-            }
-            if (completion) {
-                completion(status, output ?: @"");
-            }
-        });
-    });
-}
-
-- (NSString *)readOutputFromPipe:(NSPipe *)pipe
-{
-    NSData *data = [[pipe fileHandleForReading] readDataToEndOfFile];
-    if ([data length] == 0) {
-        return @"";
-    }
-
-    NSString *text = [[NSString alloc] initWithData:data encoding:NSUTF8StringEncoding];
-    if (!text) {
-        return @"<non-UTF8 output>\n";
-    }
-    return text;
+    return [bookmark exportRepresentation];
 }
 
 - (NSDictionary *)preparedPasswordDecisionForServer:(NSString *)server
@@ -2078,10 +1943,10 @@ typedef enum SMBTaskPurpose {
                 nil];
     }
 
-    savedPassword = [self keychainPasswordForServer:server
-                                               user:user
-                                             domain:domain
-                                              found:&foundInKeychain];
+    savedPassword = [self.keychainStore passwordForServer:server
+                                                     user:user
+                                                   domain:domain
+                                                    found:&foundInKeychain];
     if (foundInKeychain) {
         return [NSDictionary dictionaryWithObjectsAndKeys:
                 savedPassword ?: @"", @"password",
@@ -2135,173 +2000,6 @@ typedef enum SMBTaskPurpose {
             [passwordField stringValue] ?: @"", @"password",
             [NSNumber numberWithBool:([rememberCheckbox state] == NSOnState)], @"remember",
             nil];
-}
-
-- (NSString *)keychainPasswordForServer:(NSString *)server
-                                   user:(NSString *)user
-                                 domain:(NSString *)domain
-                                  found:(BOOL *)found
-{
-    UInt32 passwordLength = 0;
-    void *passwordData = NULL;
-    SecKeychainItemRef itemRef = NULL;
-    OSStatus status = SecKeychainFindInternetPassword(NULL,
-                                                      (UInt32)[server lengthOfBytesUsingEncoding:NSUTF8StringEncoding],
-                                                      [server UTF8String],
-                                                      (UInt32)[domain lengthOfBytesUsingEncoding:NSUTF8StringEncoding],
-                                                      [domain length] > 0 ? [domain UTF8String] : NULL,
-                                                      (UInt32)[user lengthOfBytesUsingEncoding:NSUTF8StringEncoding],
-                                                      [user UTF8String],
-                                                      0,
-                                                      NULL,
-                                                      0,
-                                                      kSecProtocolTypeSMB,
-                                                      kSecAuthenticationTypeDefault,
-                                                      &passwordLength,
-                                                      &passwordData,
-                                                      &itemRef);
-    NSString *password = nil;
-
-    if (found) {
-        *found = (status == errSecSuccess);
-    }
-    if (status != errSecSuccess) {
-        if (itemRef != NULL) {
-            CFRelease(itemRef);
-        }
-        return nil;
-    }
-
-    if (passwordLength == 0) {
-        password = @"";
-    } else {
-        password = [[NSString alloc] initWithBytes:passwordData
-                                            length:passwordLength
-                                          encoding:NSUTF8StringEncoding];
-        if (!password) {
-            password = [[NSString alloc] initWithData:[NSData dataWithBytes:passwordData length:passwordLength]
-                                             encoding:NSISOLatin1StringEncoding];
-        }
-    }
-
-    if (passwordData != NULL) {
-        SecKeychainItemFreeContent(NULL, passwordData);
-    }
-    if (itemRef != NULL) {
-        CFRelease(itemRef);
-    }
-
-    return password ?: @"";
-}
-
-- (BOOL)hasKeychainPasswordForServer:(NSString *)server user:(NSString *)user domain:(NSString *)domain
-{
-    BOOL found = NO;
-    [self keychainPasswordForServer:server user:user domain:domain found:&found];
-    return found;
-}
-
-- (OSStatus)storePasswordInKeychain:(NSString *)password
-                             server:(NSString *)server
-                               user:(NSString *)user
-                             domain:(NSString *)domain
-{
-    SecKeychainItemRef itemRef = NULL;
-    OSStatus status = SecKeychainFindInternetPassword(NULL,
-                                                      (UInt32)[server lengthOfBytesUsingEncoding:NSUTF8StringEncoding],
-                                                      [server UTF8String],
-                                                      (UInt32)[domain lengthOfBytesUsingEncoding:NSUTF8StringEncoding],
-                                                      [domain length] > 0 ? [domain UTF8String] : NULL,
-                                                      (UInt32)[user lengthOfBytesUsingEncoding:NSUTF8StringEncoding],
-                                                      [user UTF8String],
-                                                      0,
-                                                      NULL,
-                                                      0,
-                                                      kSecProtocolTypeSMB,
-                                                      kSecAuthenticationTypeDefault,
-                                                      NULL,
-                                                      NULL,
-                                                      &itemRef);
-    NSData *passwordData = [password dataUsingEncoding:NSUTF8StringEncoding] ?: [NSData data];
-
-    if (status == errSecSuccess && itemRef != NULL) {
-        status = SecKeychainItemModifyAttributesAndData(itemRef,
-                                                        NULL,
-                                                        (UInt32)[passwordData length],
-                                                        [passwordData bytes]);
-        CFRelease(itemRef);
-        return status;
-    }
-
-    if (status != errSecItemNotFound) {
-        if (itemRef != NULL) {
-            CFRelease(itemRef);
-        }
-        return status;
-    }
-
-    return SecKeychainAddInternetPassword(NULL,
-                                          (UInt32)[server lengthOfBytesUsingEncoding:NSUTF8StringEncoding],
-                                          [server UTF8String],
-                                          (UInt32)[domain lengthOfBytesUsingEncoding:NSUTF8StringEncoding],
-                                          [domain length] > 0 ? [domain UTF8String] : NULL,
-                                          (UInt32)[user lengthOfBytesUsingEncoding:NSUTF8StringEncoding],
-                                          [user UTF8String],
-                                          0,
-                                          NULL,
-                                          0,
-                                          kSecProtocolTypeSMB,
-                                          kSecAuthenticationTypeDefault,
-                                          (UInt32)[passwordData length],
-                                          [passwordData bytes],
-                                          NULL);
-}
-
-- (OSStatus)deletePasswordFromKeychainForServer:(NSString *)server
-                                           user:(NSString *)user
-                                         domain:(NSString *)domain
-{
-    SecKeychainItemRef itemRef = NULL;
-    OSStatus status = SecKeychainFindInternetPassword(NULL,
-                                                      (UInt32)[server lengthOfBytesUsingEncoding:NSUTF8StringEncoding],
-                                                      [server UTF8String],
-                                                      (UInt32)[domain lengthOfBytesUsingEncoding:NSUTF8StringEncoding],
-                                                      [domain length] > 0 ? [domain UTF8String] : NULL,
-                                                      (UInt32)[user lengthOfBytesUsingEncoding:NSUTF8StringEncoding],
-                                                      [user UTF8String],
-                                                      0,
-                                                      NULL,
-                                                      0,
-                                                      kSecProtocolTypeSMB,
-                                                      kSecAuthenticationTypeDefault,
-                                                      NULL,
-                                                      NULL,
-                                                      &itemRef);
-
-    if (status != errSecSuccess) {
-        if (itemRef != NULL) {
-            CFRelease(itemRef);
-        }
-        return status;
-    }
-
-    status = SecKeychainItemDelete(itemRef);
-    CFRelease(itemRef);
-    return status;
-}
-
-- (NSString *)securityErrorStringForStatus:(OSStatus)status
-{
-    CFStringRef message = SecCopyErrorMessageString(status, NULL);
-    NSString *string = nil;
-
-    if (message != NULL) {
-        string = CFBridgingRelease(message);
-    }
-    if ([string length] == 0) {
-        string = [NSString stringWithFormat:@"Security error %d", (int)status];
-    }
-    return string;
 }
 
 - (NSArray *)parseShareNamesFromOutput:(NSString *)output
@@ -2377,11 +2075,7 @@ typedef enum SMBTaskPurpose {
     }
 
     for (NSDictionary *bookmark in stored) {
-        NSMutableDictionary *normalized = [bookmark mutableCopy];
-        if ([[normalized objectForKey:@"uuid"] length] == 0) {
-            [normalized setObject:[self generateBookmarkUUID] forKey:@"uuid"];
-        }
-        [self.bookmarks addObject:normalized];
+        [self.bookmarks addObject:[SMBConnection connectionFromDictionary:bookmark]];
     }
 
     [self persistBookmarks];
@@ -2389,7 +2083,13 @@ typedef enum SMBTaskPurpose {
 
 - (void)persistBookmarks
 {
-    [[NSUserDefaults standardUserDefaults] setObject:self.bookmarks forKey:kSMBBookmarkDefaultsKey];
+    NSMutableArray *stored = [NSMutableArray array];
+
+    for (SMBConnection *bookmark in self.bookmarks) {
+        [stored addObject:[bookmark dictionaryRepresentation]];
+    }
+
+    [[NSUserDefaults standardUserDefaults] setObject:stored forKey:kSMBBookmarkDefaultsKey];
     [[NSUserDefaults standardUserDefaults] synchronize];
 }
 
@@ -2406,7 +2106,7 @@ typedef enum SMBTaskPurpose {
 - (void)refreshButtons
 {
     BOOL hasSelection = ([self selectedBookmarkRow] >= 0);
-    NSDictionary *bookmark = [self selectedBookmark];
+    SMBConnection *bookmark = [self selectedBookmark];
     BOOL isMounted = (bookmark != nil && [self isBookmarkMounted:bookmark]);
     (void)hasSelection;
     (void)isMounted;
@@ -2425,8 +2125,8 @@ typedef enum SMBTaskPurpose {
     }
 
     for (i = 0; i < (NSInteger)[self.bookmarks count]; i++) {
-        NSDictionary *bookmark = [self.bookmarks objectAtIndex:(NSUInteger)i];
-        NSString *uuid = [bookmark objectForKey:@"uuid"];
+        SMBConnection *bookmark = [self.bookmarks objectAtIndex:(NSUInteger)i];
+        NSString *uuid = bookmark.uuid;
         NSString *title = [self bookmarkMenuTitleForBookmark:bookmark];
         NSMenuItem *item = [self menuItemWithTitle:title
                                             action:@selector(selectBookmarkFromMenuItem:)
@@ -2465,7 +2165,7 @@ typedef enum SMBTaskPurpose {
     [self refreshButtons];
 }
 
-- (NSDictionary *)selectedBookmark
+- (SMBConnection *)selectedBookmark
 {
     NSInteger row = [self selectedBookmarkRow];
     if (row < 0 || row >= (NSInteger)[self.bookmarks count]) {
@@ -2483,37 +2183,14 @@ typedef enum SMBTaskPurpose {
     return row;
 }
 
-- (NSString *)bookmarkDisplayName:(NSDictionary *)bookmark
+- (NSString *)bookmarkDisplayName:(SMBConnection *)bookmark
 {
-    NSString *name = [bookmark objectForKey:@"name"];
-    NSString *share = [bookmark objectForKey:@"share"];
-    NSString *server = [bookmark objectForKey:@"server"];
-
-    if ([name length] > 0) {
-        return name;
-    }
-    if ([share length] > 0) {
-        return share;
-    }
-    if ([server length] > 0) {
-        return server;
-    }
-    return @"Untitled Connection";
+    return [bookmark displayName];
 }
 
-- (NSString *)bookmarkMenuTitleForBookmark:(NSDictionary *)bookmark
+- (NSString *)bookmarkMenuTitleForBookmark:(SMBConnection *)bookmark
 {
-    NSString *title = [self bookmarkDisplayName:bookmark];
-    NSString *server = [bookmark objectForKey:@"server"] ?: @"";
-    BOOL mounted = [self isBookmarkMounted:bookmark];
-
-    if ([server length] > 0) {
-        title = [NSString stringWithFormat:@"%@ (%@)", title, server];
-    }
-    if (mounted) {
-        title = [NSString stringWithFormat:@"• %@ Connected", title];
-    }
-    return title;
+    return [bookmark menuTitleWithMounted:[self isBookmarkMounted:bookmark]];
 }
 
 - (NSInteger)rowForBookmarkUUID:(NSString *)uuid
@@ -2525,8 +2202,8 @@ typedef enum SMBTaskPurpose {
     }
 
     for (i = 0; i < (NSInteger)[self.bookmarks count]; i++) {
-        NSDictionary *bookmark = [self.bookmarks objectAtIndex:(NSUInteger)i];
-        if ([[bookmark objectForKey:@"uuid"] isEqualToString:uuid]) {
+        SMBConnection *bookmark = [self.bookmarks objectAtIndex:(NSUInteger)i];
+        if ([bookmark.uuid isEqualToString:uuid]) {
             return i;
         }
     }
@@ -2534,21 +2211,17 @@ typedef enum SMBTaskPurpose {
     return -1;
 }
 
-- (NSString *)mountedPathForBookmark:(NSDictionary *)bookmark
+- (NSString *)mountedPathForBookmark:(SMBConnection *)bookmark
 {
-    NSString *uuid = [bookmark objectForKey:@"uuid"];
-    if ([uuid length] == 0) {
-        return @"";
-    }
-    return [self.mountedBookmarkPaths objectForKey:uuid] ?: @"";
+    return bookmark.mountedPath ?: @"";
 }
 
-- (BOOL)isBookmarkMounted:(NSDictionary *)bookmark
+- (BOOL)isBookmarkMounted:(SMBConnection *)bookmark
 {
     return [[self mountedPathForBookmark:bookmark] length] > 0;
 }
 
-- (void)openMountedBookmarkInFinder:(NSDictionary *)bookmark
+- (void)openMountedBookmarkInFinder:(SMBConnection *)bookmark
 {
     NSString *mountpoint = [self mountedPathForBookmark:bookmark];
 
@@ -2564,10 +2237,7 @@ typedef enum SMBTaskPurpose {
             [self setStatus:@"Finder could not open the mounted folder."];
         }
     } else {
-        NSString *uuid = [bookmark objectForKey:@"uuid"];
-        if ([uuid length] > 0) {
-            [self.mountedBookmarkPaths removeObjectForKey:uuid];
-        }
+        bookmark.mountedPath = nil;
         [self reloadBookmarkList];
         [self setStatus:@"The saved mount path no longer exists."];
     }
@@ -2599,13 +2269,12 @@ typedef enum SMBTaskPurpose {
     return [output substringWithRange:[match rangeAtIndex:1]];
 }
 
-- (NSString *)bestGuessMountpointForBookmark:(NSDictionary *)bookmark
+- (NSString *)bestGuessMountpointForBookmark:(SMBConnection *)bookmark
 {
-    NSString *share = [bookmark objectForKey:@"share"];
     NSArray *candidates = [self mountpointCandidatesForBookmark:bookmark];
     NSFileManager *fm = [NSFileManager defaultManager];
 
-    if ([share length] == 0) {
+    if ([bookmark.share length] == 0) {
         return @"";
     }
 
@@ -2615,31 +2284,22 @@ typedef enum SMBTaskPurpose {
         }
     }
 
-    return [@"/Volumes" stringByAppendingPathComponent:share];
+    return [@"/Volumes" stringByAppendingPathComponent:bookmark.share];
 }
 
-- (NSArray *)mountpointCandidatesForBookmark:(NSDictionary *)bookmark
+- (NSArray *)mountpointCandidatesForBookmark:(SMBConnection *)bookmark
 {
-    NSString *share = [bookmark objectForKey:@"share"];
-
-    if ([share length] == 0) {
-        return [NSArray array];
-    }
-
-    return [NSArray arrayWithObjects:
-            [@"/Volumes" stringByAppendingPathComponent:share],
-            [[NSHomeDirectory() stringByAppendingPathComponent:@"Volumes"] stringByAppendingPathComponent:share],
-            nil];
+    return [bookmark mountpointCandidates];
 }
 
-- (NSSet *)mountedPathsFromSystem
+- (NSArray *)mountedEntriesFromSystem
 {
-    NSString *output = [self outputForCommandAtPath:@"/sbin/mount"
-                                          arguments:nil
-                                  terminationStatus:NULL];
-    NSMutableSet *paths = [NSMutableSet set];
+    NSString *output = [self.taskRunner outputForCommandAtPath:@"/sbin/mount"
+                                                     arguments:nil
+                                             terminationStatus:NULL];
+    NSMutableArray *entries = [NSMutableArray array];
     NSArray *lines = [output componentsSeparatedByCharactersInSet:[NSCharacterSet newlineCharacterSet]];
-    NSRegularExpression *regex = [NSRegularExpression regularExpressionWithPattern:@" on (.+?) \\("
+    NSRegularExpression *regex = [NSRegularExpression regularExpressionWithPattern:@"^(.*?) on (.+?) \\("
                                                                            options:0
                                                                              error:NULL];
 
@@ -2647,50 +2307,106 @@ typedef enum SMBTaskPurpose {
         NSTextCheckingResult *match = [regex firstMatchInString:line
                                                         options:0
                                                           range:NSMakeRange(0, [line length])];
-        if (!match || [match numberOfRanges] < 2) {
+        NSString *source = nil;
+        NSString *mountpoint = nil;
+
+        if (!match || [match numberOfRanges] < 3) {
             continue;
         }
-        [paths addObject:[line substringWithRange:[match rangeAtIndex:1]]];
+        source = [self normalizedMountSource:[line substringWithRange:[match rangeAtIndex:1]]];
+        mountpoint = [[line substringWithRange:[match rangeAtIndex:2]]
+                      stringByTrimmingCharactersInSet:[NSCharacterSet whitespaceAndNewlineCharacterSet]];
+        if ([mountpoint length] == 0) {
+            continue;
+        }
+        [entries addObject:[NSDictionary dictionaryWithObjectsAndKeys:
+                            source ?: @"", @"source",
+                            mountpoint, @"mountpoint",
+                            nil]];
     }
 
-    return paths;
+    return entries;
 }
 
 - (void)refreshMountedBookmarkPathsFromSystem
 {
-    NSSet *mountedPaths = [self mountedPathsFromSystem];
-    NSMutableDictionary *detected = [NSMutableDictionary dictionary];
+    NSArray *entries = [self mountedEntriesFromSystem];
+    NSMutableSet *mountedPaths = [NSMutableSet set];
+    NSMutableDictionary *pathsBySource = [NSMutableDictionary dictionary];
+    NSMutableDictionary *candidateOwners = [NSMutableDictionary dictionary];
 
-    for (NSDictionary *bookmark in self.bookmarks) {
-        NSString *uuid = [bookmark objectForKey:@"uuid"];
-        if ([uuid length] == 0) {
+    for (NSDictionary *entry in entries) {
+        NSString *mountpoint = [entry objectForKey:@"mountpoint"] ?: @"";
+        NSString *source = [[entry objectForKey:@"source"] ?: @"" lowercaseString];
+        NSMutableArray *mountpoints = nil;
+
+        if ([mountpoint length] == 0) {
             continue;
         }
 
-        for (NSString *candidate in [self mountpointCandidatesForBookmark:bookmark]) {
-            if ([mountedPaths containsObject:candidate]) {
-                [detected setObject:candidate forKey:uuid];
-                break;
+        [mountedPaths addObject:mountpoint];
+        if ([source length] == 0) {
+            continue;
+        }
+
+        mountpoints = [pathsBySource objectForKey:source];
+        if (!mountpoints) {
+            mountpoints = [NSMutableArray array];
+            [pathsBySource setObject:mountpoints forKey:source];
+        }
+        [mountpoints addObject:mountpoint];
+    }
+
+    for (SMBConnection *bookmark in self.bookmarks) {
+        for (NSString *candidate in [bookmark mountpointCandidates]) {
+            NSMutableArray *owners = [candidateOwners objectForKey:candidate];
+            if (!owners) {
+                owners = [NSMutableArray array];
+                [candidateOwners setObject:owners forKey:candidate];
             }
+            [owners addObject:bookmark.uuid ?: @""];
         }
     }
 
-    self.mountedBookmarkPaths = detected;
-}
+    for (SMBConnection *bookmark in self.bookmarks) {
+        NSString *resolvedPath = nil;
+        NSArray *sourceMatches = nil;
 
-- (void)appendOptionalFlag:(NSString *)flag value:(NSString *)value toArguments:(NSMutableArray *)arguments
-{
-    if ([value length] > 0) {
-        [arguments addObject:flag];
-        [arguments addObject:value];
+        if ([bookmark.mountedPath length] > 0 && [mountedPaths containsObject:bookmark.mountedPath]) {
+            continue;
+        }
+
+        sourceMatches = [pathsBySource objectForKey:[bookmark expectedFSName]];
+        if ([sourceMatches count] == 1) {
+            resolvedPath = [sourceMatches objectAtIndex:0];
+        } else if ([sourceMatches count] > 1) {
+            resolvedPath = nil;
+        } else {
+            NSMutableArray *candidateMatches = [NSMutableArray array];
+            for (NSString *candidate in [bookmark mountpointCandidates]) {
+                NSArray *owners = [candidateOwners objectForKey:candidate];
+                if ([mountedPaths containsObject:candidate] && [owners count] == 1) {
+                    [candidateMatches addObject:candidate];
+                }
+            }
+            if ([candidateMatches count] == 1) {
+                resolvedPath = [candidateMatches objectAtIndex:0];
+            }
+        }
+
+        bookmark.mountedPath = [resolvedPath length] > 0 ? resolvedPath : nil;
     }
 }
 
-- (NSString *)generateBookmarkUUID
+- (NSString *)normalizedMountSource:(NSString *)source
 {
-    return [NSString stringWithFormat:@"bookmark-%f-%u",
-            [[NSDate date] timeIntervalSince1970],
-            arc4random()];
+    NSString *trimmed = [[source ?: @"" stringByTrimmingCharactersInSet:[NSCharacterSet whitespaceAndNewlineCharacterSet]] lowercaseString];
+    NSRange fsnameRange = [trimmed rangeOfString:@"//"];
+
+    if (fsnameRange.location != NSNotFound) {
+        return [trimmed substringFromIndex:fsnameRange.location];
+    }
+    return trimmed;
 }
 
 - (NSString *)trimmedString:(NSString *)string
@@ -2739,13 +2455,6 @@ typedef enum SMBTaskPurpose {
     return clean;
 }
 
-- (void)setDictionary:(NSMutableDictionary *)dictionary value:(NSString *)value forKey:(NSString *)key
-{
-    if ([value length] > 0) {
-        [dictionary setObject:value forKey:key];
-    }
-}
-
 - (void)setStatus:(NSString *)status
 {
     [self.statusField setStringValue:status ?: @""];
@@ -2762,7 +2471,7 @@ typedef enum SMBTaskPurpose {
     NSString *bundlePath = [[NSBundle mainBundle] bundlePath];
     NSString *repoPath = [[[[bundlePath stringByDeletingLastPathComponent]
                             stringByDeletingLastPathComponent]
-                           stringByAppendingPathComponent:@"../smb2fs"] stringByStandardizingPath];
+                           stringByAppendingPathComponent:@"../cli/smb2fs"] stringByStandardizingPath];
     if ([fm isExecutableFileAtPath:repoPath]) {
         return repoPath;
     }
@@ -2774,94 +2483,56 @@ typedef enum SMBTaskPurpose {
     return @"";
 }
 
-- (NSString *)outputForCommandAtPath:(NSString *)path arguments:(NSArray *)arguments terminationStatus:(int *)terminationStatus
+- (void)appendOptionalFlag:(NSString *)flag value:(NSString *)value toArguments:(NSMutableArray *)arguments
 {
-    NSTask *task = nil;
-    NSPipe *pipe = nil;
-    NSString *output = @"";
-
-    if (terminationStatus) {
-        *terminationStatus = -1;
+    if ([value length] > 0) {
+        [arguments addObject:flag];
+        [arguments addObject:value];
     }
-    if ([path length] == 0) {
-        return @"";
-    }
-
-    task = [[NSTask alloc] init];
-    pipe = [NSPipe pipe];
-    [task setLaunchPath:path];
-    [task setArguments:arguments ?: [NSArray array]];
-    [task setStandardOutput:pipe];
-    [task setStandardError:pipe];
-
-    @try {
-        [task launch];
-        output = [self readOutputFromPipe:pipe];
-        [task waitUntilExit];
-        if (terminationStatus) {
-            *terminationStatus = [task terminationStatus];
-        }
-    }
-    @catch (NSException *exception) {
-        output = [NSString stringWithFormat:@"Failed to launch task: %@\n", [exception reason]];
-    }
-
-    return output ?: @"";
 }
 
-- (NSString *)outputForCommandAtPath:(NSString *)path
-                           arguments:(NSArray *)arguments
-                            password:(NSString *)password
-                   terminationStatus:(int *)terminationStatus
+- (NSMutableArray *)mountArgumentsForConnection:(SMBConnection *)connection
 {
-    NSTask *task = nil;
-    NSPipe *pipe = nil;
-    NSPipe *inputPipe = nil;
-    NSString *output = @"";
+    NSMutableArray *arguments = [NSMutableArray arrayWithObjects:
+                                 @"--server", connection.server ?: @"",
+                                 @"--share", connection.share ?: @"",
+                                 nil];
 
-    if (terminationStatus) {
-        *terminationStatus = -1;
+    [self appendOptionalFlag:@"--user" value:connection.user toArguments:arguments];
+    [self appendOptionalFlag:@"--domain" value:connection.domain toArguments:arguments];
+    if ([connection.user length] > 0) {
+        [arguments addObject:@"--passfd"];
+        [arguments addObject:@"0"];
     }
-    if ([path length] == 0) {
-        return @"";
-    }
+    return arguments;
+}
 
-    task = [[NSTask alloc] init];
-    pipe = [NSPipe pipe];
-    [task setLaunchPath:path];
-    [task setArguments:arguments ?: [NSArray array]];
-    [task setStandardOutput:pipe];
-    [task setStandardError:pipe];
+- (NSMutableArray *)listSharesArgumentsForConnection:(SMBConnection *)connection
+{
+    return [self listSharesArgumentsForServer:connection.server
+                                         user:connection.user
+                                       domain:connection.domain];
+}
 
-    if (password != nil) {
-        inputPipe = [NSPipe pipe];
-        [task setStandardInput:inputPipe];
-    }
+- (NSMutableArray *)listSharesArgumentsForServer:(NSString *)server
+                                            user:(NSString *)user
+                                          domain:(NSString *)domain
+{
+    NSMutableArray *arguments = [NSMutableArray arrayWithObjects:@"--list-shares", @"--server", server ?: @"", nil];
 
-    @try {
-        [task launch];
-        if (inputPipe) {
-            NSData *data = [password dataUsingEncoding:NSUTF8StringEncoding];
-            [[inputPipe fileHandleForWriting] writeData:data];
-            [[inputPipe fileHandleForWriting] closeFile];
-        }
-        output = [self readOutputFromPipe:pipe];
-        [task waitUntilExit];
-        if (terminationStatus) {
-            *terminationStatus = [task terminationStatus];
-        }
+    [self appendOptionalFlag:@"--user" value:user toArguments:arguments];
+    [self appendOptionalFlag:@"--domain" value:domain toArguments:arguments];
+    if ([user length] > 0) {
+        [arguments addObject:@"--passfd"];
+        [arguments addObject:@"0"];
     }
-    @catch (NSException *exception) {
-        output = [NSString stringWithFormat:@"Failed to launch task: %@\n", [exception reason]];
-    }
-
-    return output ?: @"";
+    return arguments;
 }
 
 - (BOOL)validateMenuItem:(NSMenuItem *)menuItem
 {
     SEL action = [menuItem action];
-    NSDictionary *bookmark = [self selectedBookmark];
+    SMBConnection *bookmark = [self selectedBookmark];
     BOOL hasSelection = (bookmark != nil);
     BOOL isMounted = (hasSelection && [self isBookmarkMounted:bookmark]);
     NSString *uuid = nil;

@@ -1,32 +1,19 @@
-CC ?= gcc
 PREFIX ?= /usr/local
-
-TARGET := smb2fs
-SRC := smb2fs.c
-
-CPPFLAGS += -I$(PREFIX)/include/osxfuse/fuse \
-            -I$(PREFIX)/include/osxfuse \
-            -I$(PREFIX)/include
-CFLAGS += -O2 -D_FILE_OFFSET_BITS=64
-LDFLAGS += -Wl,-rpath,$(PREFIX)/lib
-LDLIBS += $(PREFIX)/lib/libsmb2.a \
-          $(PREFIX)/lib/libosxfuse.2.dylib
+CC ?= gcc
 
 .PHONY: all cli gui clean check-link
 
 all: cli gui
 
-cli: $(TARGET)
+cli:
+	$(MAKE) -C cli PREFIX=$(PREFIX) CC=$(CC)
 
 gui:
 	$(MAKE) -C gui
 
-$(TARGET): $(SRC)
-	$(CC) -o $@ $(SRC) $(CPPFLAGS) $(CFLAGS) $(LDLIBS) $(LDFLAGS)
-
 clean:
-	rm -f $(TARGET)
+	$(MAKE) -C cli clean
 	$(MAKE) -C gui clean
 
-check-link: cli
-	otool -L ./$(TARGET) | egrep -i 'osxfuse|fuse'
+check-link:
+	$(MAKE) -C cli PREFIX=$(PREFIX) CC=$(CC) check-link

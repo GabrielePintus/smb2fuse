@@ -29,13 +29,13 @@ This directory contains a separate native AppKit wrapper for `smb2fs`.
 
 ## Build
 
-Build the CLI first from the repository root:
+Build the whole project from the repository root:
 
 ```bash
 make
 ```
 
-Then build the app bundle from this directory:
+Or, if you only want to rebuild the GUI from this directory:
 
 ```bash
 cd gui
@@ -48,7 +48,7 @@ The app bundle is written to:
 gui/build/SMB2FUSE.app
 ```
 
-If `../smb2fs` exists, the build copies it into the app bundle as `Contents/Resources/smb2fs`.
+If `../cli/smb2fs` exists, the build copies it into the app bundle as `Contents/Resources/smb2fs`.
 If `Assets/Icon.png` exists, the build also converts it into a proper `.icns` app icon and copies it into the bundle.
 
 ## Notes
