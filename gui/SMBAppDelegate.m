@@ -103,8 +103,8 @@ static NSInteger const kSMBEditorErrorTag = 1099;
                                         bold:NO
                                         size:12.0];
     [self.mountedField setAlignment:NSRightTextAlignment];
-    [self.mountedField setTextColor:[NSColor colorWithCalibratedRed:0.20 green:0.62 blue:0.20 alpha:1.0]];
     [self addSubview:self.mountedField];
+    [self updateTextColors];
 
     return self;
 }
@@ -120,6 +120,12 @@ static NSInteger const kSMBEditorErrorTag = 1099;
     [self.mountedField setFrame:NSMakeRect(width - 90.0, 21.0, 76.0, 20.0)];
 }
 
+- (void)setBackgroundStyle:(NSBackgroundStyle)backgroundStyle
+{
+    [super setBackgroundStyle:backgroundStyle];
+    [self updateTextColors];
+}
+
 - (NSTextField *)labelWithFrame:(NSRect)frame bold:(BOOL)bold size:(CGFloat)size
 {
     NSTextField *label = [[NSTextField alloc] initWithFrame:frame];
@@ -130,6 +136,18 @@ static NSInteger const kSMBEditorErrorTag = 1099;
     [label setFont:bold ? [NSFont boldSystemFontOfSize:size] : [NSFont systemFontOfSize:size]];
     [[label cell] setLineBreakMode:NSLineBreakByTruncatingTail];
     return label;
+}
+
+- (void)updateTextColors
+{
+    BOOL selected = ([self backgroundStyle] == NSBackgroundStyleDark);
+
+    [self.titleField setTextColor:selected ? [NSColor whiteColor] : [NSColor blackColor]];
+    [self.subtitleField setTextColor:selected ? [NSColor colorWithCalibratedWhite:0.92 alpha:1.0] : [NSColor darkGrayColor]];
+    [self.detailField setTextColor:selected ? [NSColor colorWithCalibratedWhite:0.86 alpha:1.0] : [NSColor grayColor]];
+    [self.mountedField setTextColor:selected
+                                   ? [NSColor colorWithCalibratedWhite:0.94 alpha:1.0]
+                                   : [NSColor colorWithCalibratedRed:0.20 green:0.62 blue:0.20 alpha:1.0]];
 }
 
 @end
@@ -147,6 +165,9 @@ static NSInteger const kSMBEditorErrorTag = 1099;
 @property (strong) SMBTaskRunner *taskRunner;
 @property (strong) SMBKeychainStore *keychainStore;
 @property (assign) BOOL taskRunning;
+@property (assign) BOOL refreshInProgress;
+@property (assign) BOOL refreshPending;
+@property (assign) BOOL editorBrowseInProgress;
 
 @end
 
@@ -162,7 +183,11 @@ static NSInteger const kSMBEditorErrorTag = 1099;
     [self loadBookmarks];
     [self installMainMenu];
     [self buildWindow];
-    [self reloadBookmarkList];
+    [self.bookmarksTable reloadData];
+    [self refreshCount];
+    [self rebuildBookmarksMenu];
+    [self updateEmptyState];
+    [self requestMountedStateRefresh];
     [self.window center];
     [self.window makeKeyAndOrderFront:nil];
     [NSApp activateIgnoringOtherApps:YES];
@@ -608,7 +633,7 @@ static NSInteger const kSMBEditorErrorTag = 1099;
 - (IBAction)connectSelectedBookmark:(id)sender
 {
     (void)sender;
-    [self refreshMountedBookmarkPathsFromSystem];
+    [self requestMountedStateRefresh];
     if (self.taskRunning) {
         [self setStatus:@"A task is already running."];
         return;
@@ -699,7 +724,7 @@ static NSInteger const kSMBEditorErrorTag = 1099;
 - (IBAction)disconnectSelectedBookmark:(id)sender
 {
     (void)sender;
-    [self refreshMountedBookmarkPathsFromSystem];
+    [self requestMountedStateRefresh];
     if (self.taskRunning) {
         [self setStatus:@"A task is already running."];
         return;
@@ -747,7 +772,7 @@ static NSInteger const kSMBEditorErrorTag = 1099;
 - (IBAction)listShares:(id)sender
 {
     (void)sender;
-    [self refreshMountedBookmarkPathsFromSystem];
+    [self requestMountedStateRefresh];
     if (self.taskRunning) {
         [self setStatus:@"A task is already running."];
         return;
@@ -826,7 +851,7 @@ static NSInteger const kSMBEditorErrorTag = 1099;
 - (IBAction)activateSelectedBookmark:(id)sender
 {
     (void)sender;
-    [self refreshMountedBookmarkPathsFromSystem];
+    [self requestMountedStateRefresh];
 
     SMBConnection *bookmark = [self selectedBookmark];
     if (!bookmark) {
@@ -844,7 +869,7 @@ static NSInteger const kSMBEditorErrorTag = 1099;
 - (IBAction)openSelectedBookmarkInFinder:(id)sender
 {
     (void)sender;
-    [self refreshMountedBookmarkPathsFromSystem];
+    [self requestMountedStateRefresh];
     SMBConnection *bookmark = [self selectedBookmark];
 
     if (!bookmark) {
@@ -858,7 +883,7 @@ static NSInteger const kSMBEditorErrorTag = 1099;
 - (IBAction)revealSelectedMountPoint:(id)sender
 {
     (void)sender;
-    [self refreshMountedBookmarkPathsFromSystem];
+    [self requestMountedStateRefresh];
     SMBConnection *bookmark = [self selectedBookmark];
     NSString *mountpoint = nil;
 
@@ -1286,6 +1311,9 @@ static NSInteger const kSMBEditorErrorTag = 1099;
         [errorLabel setStringValue:@"smb2fs is not available. Build the CLI first, then rebuild the app."];
         return;
     }
+    if (self.editorBrowseInProgress) {
+        return;
+    }
 
     if ([user length] > 0) {
         passwordDecision = [self preparedPasswordDecisionForServer:server
@@ -1302,41 +1330,50 @@ static NSInteger const kSMBEditorErrorTag = 1099;
     }
 
     arguments = [self listSharesArgumentsForServer:server user:user domain:domain];
+    self.editorBrowseInProgress = YES;
+    [(NSButton *)sender setEnabled:NO];
+    [errorLabel setStringValue:@"Listing shares..."];
 
-    output = [self.taskRunner outputForCommandAtPath:executablePath
-                                           arguments:arguments
-                                         stdinString:password
-                                   terminationStatus:&status];
-    if (status != 0) {
-        [self showTextPanelWithTitle:@"Share Listing Failed" text:output];
-        [errorLabel setStringValue:@"Could not list shares for that server."];
-        return;
-    }
+    [self.taskRunner runCommandAtPath:executablePath
+                            arguments:arguments
+                          stdinString:password
+                           completion:^(int asyncStatus, NSString *asyncOutput) {
+        self.editorBrowseInProgress = NO;
+        [(NSButton *)sender setEnabled:YES];
 
-    if (shouldRememberPassword) {
-        OSStatus saveStatus = [self.keychainStore storePassword:password server:server user:user domain:domain];
-        if (saveStatus != errSecSuccess) {
-            [self showTextPanelWithTitle:@"Keychain Save Failed"
-                                    text:[NSString stringWithFormat:@"The share listing succeeded, but the password could not be saved in the Mac keychain.\n\n%@",
-                                          [self.keychainStore errorStringForStatus:saveStatus]]];
+        output = asyncOutput;
+        status = asyncStatus;
+        if (status != 0) {
+            [self showTextPanelWithTitle:@"Share Listing Failed" text:output];
+            [errorLabel setStringValue:@"Could not list shares for that server."];
+            return;
         }
-    }
 
-    shares = [self parseShareNamesFromOutput:output];
-    if ([shares count] == 0) {
-        [self showTextPanelWithTitle:@"Visible Shares" text:@"No browseable shares were returned."];
-        [errorLabel setStringValue:@"No browseable shares were returned."];
-        return;
-    }
+        if (shouldRememberPassword) {
+            OSStatus saveStatus = [self.keychainStore storePassword:password server:server user:user domain:domain];
+            if (saveStatus != errSecSuccess) {
+                [self showTextPanelWithTitle:@"Keychain Save Failed"
+                                        text:[NSString stringWithFormat:@"The share listing succeeded, but the password could not be saved in the Mac keychain.\n\n%@",
+                                              [self.keychainStore errorStringForStatus:saveStatus]]];
+            }
+        }
 
-    if (![self chooseShareFromArray:shares intoField:shareField nameField:nameField]) {
-        [errorLabel setStringValue:@"Share selection cancelled."];
-        return;
-    }
+        shares = [self parseShareNamesFromOutput:output];
+        if ([shares count] == 0) {
+            [self showTextPanelWithTitle:@"Visible Shares" text:@"No browseable shares were returned."];
+            [errorLabel setStringValue:@"No browseable shares were returned."];
+            return;
+        }
 
-    [self setEditorField:shareField invalid:NO];
-    [errorLabel setStringValue:@""];
-    [self updateEditorCredentialControlsForWindow:window];
+        if (![self chooseShareFromArray:shares intoField:shareField nameField:nameField]) {
+            [errorLabel setStringValue:@"Share selection cancelled."];
+            return;
+        }
+
+        [self setEditorField:shareField invalid:NO];
+        [errorLabel setStringValue:@""];
+        [self updateEditorCredentialControlsForWindow:window];
+    }];
 }
 
 - (IBAction)saveEditorPanel:(id)sender
@@ -2097,12 +2134,39 @@ static NSInteger const kSMBEditorErrorTag = 1099;
 
 - (void)reloadBookmarkList
 {
-    [self refreshMountedBookmarkPathsFromSystem];
     [self.bookmarksTable reloadData];
     [self refreshButtons];
     [self refreshCount];
     [self rebuildBookmarksMenu];
     [self updateEmptyState];
+}
+
+- (void)requestMountedStateRefresh
+{
+    if (self.refreshInProgress) {
+        self.refreshPending = YES;
+        return;
+    }
+
+    self.refreshInProgress = YES;
+    [self.taskRunner runCommandAtPath:@"/sbin/mount"
+                            arguments:nil
+                          stdinString:nil
+                           completion:^(int status, NSString *output) {
+        NSArray *entries = nil;
+
+        self.refreshInProgress = NO;
+        if (status == 0) {
+            entries = [self mountedEntriesFromOutput:output];
+            [self applyMountedEntries:entries];
+            [self reloadBookmarkList];
+        }
+
+        if (self.refreshPending) {
+            self.refreshPending = NO;
+            [self requestMountedStateRefresh];
+        }
+    }];
 }
 
 - (void)refreshButtons
@@ -2294,11 +2358,8 @@ static NSInteger const kSMBEditorErrorTag = 1099;
     return [bookmark mountpointCandidates];
 }
 
-- (NSArray *)mountedEntriesFromSystem
+- (NSArray *)mountedEntriesFromOutput:(NSString *)output
 {
-    NSString *output = [self.taskRunner outputForCommandAtPath:@"/sbin/mount"
-                                                     arguments:nil
-                                             terminationStatus:NULL];
     NSMutableArray *entries = [NSMutableArray array];
     NSArray *lines = [output componentsSeparatedByCharactersInSet:[NSCharacterSet newlineCharacterSet]];
     NSRegularExpression *regex = [NSRegularExpression regularExpressionWithPattern:@"^(.*?) on (.+?) \\("
@@ -2330,9 +2391,8 @@ static NSInteger const kSMBEditorErrorTag = 1099;
     return entries;
 }
 
-- (void)refreshMountedBookmarkPathsFromSystem
+- (void)applyMountedEntries:(NSArray *)entries
 {
-    NSArray *entries = [self mountedEntriesFromSystem];
     NSMutableSet *mountedPaths = [NSMutableSet set];
     NSMutableDictionary *pathsBySource = [NSMutableDictionary dictionary];
     NSMutableDictionary *candidateOwners = [NSMutableDictionary dictionary];
