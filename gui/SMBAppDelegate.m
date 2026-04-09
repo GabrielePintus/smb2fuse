@@ -1152,10 +1152,12 @@ static NSInteger const kSMBEditorErrorTag = 1099;
     [contentView addSubview:errorLabel];
 
     NSTextField *note = [self labelWithString:@"Passwords are stored in your Mac keychain and are never exported."
-                                        frame:NSMakeRect(18.0, 28.0, 354.0, 16.0)
+                                        frame:NSMakeRect(18.0, 24.0, 196.0, 28.0)
                                          bold:NO];
     [note setTextColor:[NSColor grayColor]];
     [note setFont:[NSFont systemFontOfSize:11.0]];
+    [[note cell] setWraps:YES];
+    [[note cell] setLineBreakMode:NSLineBreakByWordWrapping];
     [contentView addSubview:note];
 
     NSButton *cancelButton = [self buttonWithTitle:@"Cancel"
