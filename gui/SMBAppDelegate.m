@@ -157,6 +157,31 @@ static NSInteger const kSMBEditorErrorTag = 1099;
 
 @end
 
+@interface SMBBookmarkTableView : NSTableView
+
+@end
+
+@implementation SMBBookmarkTableView
+
+- (NSMenu *)menuForEvent:(NSEvent *)event
+{
+    NSPoint point = [self convertPoint:[event locationInWindow] fromView:nil];
+    NSInteger row = [self rowAtPoint:point];
+
+    if (row < 0) {
+        [self deselectAll:nil];
+        return nil;
+    }
+
+    if (![self isRowSelected:row]) {
+        [self selectRowIndexes:[NSIndexSet indexSetWithIndex:(NSUInteger)row] byExtendingSelection:NO];
+    }
+
+    return [self menu];
+}
+
+@end
+
 @interface SMBAppDelegate ()
 
 @property (strong) NSWindow *window;
@@ -165,6 +190,7 @@ static NSInteger const kSMBEditorErrorTag = 1099;
 @property (strong) NSTextField *statusField;
 @property (strong) NSTextField *countField;
 @property (strong) NSMenu *bookmarksMenu;
+@property (strong) NSMenu *contextualMenu;
 
 @property (strong) NSMutableArray *bookmarks;
 @property (strong) SMBTaskRunner *taskRunner;
@@ -234,7 +260,7 @@ static NSInteger const kSMBEditorErrorTag = 1099;
     [scrollView setHasVerticalScroller:YES];
     [contentView addSubview:scrollView];
 
-    self.bookmarksTable = [[NSTableView alloc] initWithFrame:[[scrollView contentView] bounds]];
+    self.bookmarksTable = [[SMBBookmarkTableView alloc] initWithFrame:[[scrollView contentView] bounds]];
     [self.bookmarksTable setDelegate:self];
     [self.bookmarksTable setDataSource:self];
     [self.bookmarksTable setHeaderView:nil];
@@ -244,6 +270,7 @@ static NSInteger const kSMBEditorErrorTag = 1099;
     [self.bookmarksTable setDoubleAction:@selector(activateSelectedBookmark:)];
     [self.bookmarksTable addTableColumn:[self bookmarkColumn]];
     [self syncBookmarkColumnWidth];
+    [self installContextualMenu];
     [scrollView setDocumentView:self.bookmarksTable];
 
     self.emptyStateView = [[NSView alloc] initWithFrame:[scrollView frame]];
@@ -398,6 +425,46 @@ static NSInteger const kSMBEditorErrorTag = 1099;
     [NSApp setMainMenu:mainMenu];
     [NSApp setWindowsMenu:[windowRoot submenu]];
     [NSApp setHelpMenu:[helpRoot submenu]];
+}
+
+- (void)installContextualMenu
+{
+    self.contextualMenu = [[NSMenu alloc] initWithTitle:@"Connection Actions"];
+    [self.contextualMenu addItem:[self menuItemWithTitle:@"Connect"
+                                                  action:@selector(connectSelectedBookmark:)
+                                             keyEquivalent:@""
+                                             keyModifiers:0]];
+    [self.contextualMenu addItem:[self menuItemWithTitle:@"Disconnect"
+                                                  action:@selector(disconnectSelectedBookmark:)
+                                             keyEquivalent:@""
+                                             keyModifiers:0]];
+    [self.contextualMenu addItem:[self menuItemWithTitle:@"List Shares"
+                                                  action:@selector(listShares:)
+                                             keyEquivalent:@""
+                                             keyModifiers:0]];
+    [self.contextualMenu addItem:[NSMenuItem separatorItem]];
+    [self.contextualMenu addItem:[self menuItemWithTitle:@"Open in Finder"
+                                                  action:@selector(openSelectedBookmarkInFinder:)
+                                             keyEquivalent:@""
+                                             keyModifiers:0]];
+    [self.contextualMenu addItem:[self menuItemWithTitle:@"Reveal Mount Point"
+                                                  action:@selector(revealSelectedMountPoint:)
+                                             keyEquivalent:@""
+                                             keyModifiers:0]];
+    [self.contextualMenu addItem:[NSMenuItem separatorItem]];
+    [self.contextualMenu addItem:[self menuItemWithTitle:@"Edit Connection..."
+                                                  action:@selector(editBookmark:)
+                                             keyEquivalent:@""
+                                             keyModifiers:0]];
+    [self.contextualMenu addItem:[self menuItemWithTitle:@"Duplicate Connection"
+                                                  action:@selector(duplicateSelectedBookmark:)
+                                             keyEquivalent:@""
+                                             keyModifiers:0]];
+    [self.contextualMenu addItem:[self menuItemWithTitle:@"Remove Connection"
+                                                  action:@selector(removeBookmark:)
+                                             keyEquivalent:@""
+                                             keyModifiers:0]];
+    [self.bookmarksTable setMenu:self.contextualMenu];
 }
 
 - (NSMenu *)applicationMenuWithAppName:(NSString *)appName
