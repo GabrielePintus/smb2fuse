@@ -82,27 +82,27 @@ static NSInteger const kSMBEditorErrorTag = 1099;
     [self.bookmarkIconView setImageScaling:NSImageScaleProportionallyUpOrDown];
     [self addSubview:self.bookmarkIconView];
 
-    self.titleField = [self labelWithFrame:NSMakeRect(62.0, 40.0, frameRect.size.width - 170.0, 18.0)
+    self.titleField = [self labelWithFrame:NSMakeRect(62.0, 40.0, frameRect.size.width - 200.0, 18.0)
                                       bold:YES
                                       size:14.0];
     [self addSubview:self.titleField];
 
-    self.subtitleField = [self labelWithFrame:NSMakeRect(62.0, 23.0, frameRect.size.width - 170.0, 16.0)
+    self.subtitleField = [self labelWithFrame:NSMakeRect(62.0, 23.0, frameRect.size.width - 200.0, 16.0)
                                          bold:NO
                                          size:12.0];
     [self.subtitleField setTextColor:[NSColor darkGrayColor]];
     [self addSubview:self.subtitleField];
 
-    self.detailField = [self labelWithFrame:NSMakeRect(62.0, 8.0, frameRect.size.width - 170.0, 14.0)
+    self.detailField = [self labelWithFrame:NSMakeRect(62.0, 8.0, frameRect.size.width - 200.0, 14.0)
                                        bold:NO
                                        size:11.0];
     [self.detailField setTextColor:[NSColor grayColor]];
     [self addSubview:self.detailField];
 
-    self.mountedField = [self labelWithFrame:NSMakeRect(frameRect.size.width - 118.0, 21.0, 104.0, 20.0)
+    self.mountedField = [self labelWithFrame:NSMakeRect(frameRect.size.width - 146.0, 21.0, 132.0, 20.0)
                                         bold:NO
-                                        size:12.0];
-    [self.mountedField setAlignment:NSRightTextAlignment];
+                                        size:11.0];
+    [self.mountedField setAlignment:NSCenterTextAlignment];
     [self addSubview:self.mountedField];
     [self updateTextColors];
 
@@ -114,10 +114,10 @@ static NSInteger const kSMBEditorErrorTag = 1099;
     [super layout];
 
     CGFloat width = [self bounds].size.width;
-    [self.titleField setFrame:NSMakeRect(62.0, 40.0, width - 182.0, 18.0)];
-    [self.subtitleField setFrame:NSMakeRect(62.0, 23.0, width - 182.0, 16.0)];
-    [self.detailField setFrame:NSMakeRect(62.0, 8.0, width - 182.0, 14.0)];
-    [self.mountedField setFrame:NSMakeRect(width - 118.0, 21.0, 104.0, 20.0)];
+    [self.titleField setFrame:NSMakeRect(62.0, 40.0, width - 210.0, 18.0)];
+    [self.subtitleField setFrame:NSMakeRect(62.0, 23.0, width - 210.0, 16.0)];
+    [self.detailField setFrame:NSMakeRect(62.0, 8.0, width - 210.0, 14.0)];
+    [self.mountedField setFrame:NSMakeRect(width - 146.0, 21.0, 132.0, 20.0)];
 }
 
 - (void)setBackgroundStyle:(NSBackgroundStyle)backgroundStyle
@@ -141,13 +141,18 @@ static NSInteger const kSMBEditorErrorTag = 1099;
 - (void)updateTextColors
 {
     BOOL selected = ([self backgroundStyle] == NSBackgroundStyleDark);
+    BOOL disconnected = [self.mountedField.stringValue isEqualToString:@"Not connected"];
 
     [self.titleField setTextColor:selected ? [NSColor whiteColor] : [NSColor blackColor]];
     [self.subtitleField setTextColor:selected ? [NSColor colorWithCalibratedWhite:0.92 alpha:1.0] : [NSColor darkGrayColor]];
     [self.detailField setTextColor:selected ? [NSColor colorWithCalibratedWhite:0.86 alpha:1.0] : [NSColor grayColor]];
     [self.mountedField setTextColor:selected
-                                   ? [NSColor colorWithCalibratedWhite:0.94 alpha:1.0]
-                                   : [NSColor colorWithCalibratedRed:0.20 green:0.62 blue:0.20 alpha:1.0]];
+                                   ? (disconnected
+                                      ? [NSColor colorWithCalibratedRed:1.0 green:0.84 blue:0.84 alpha:1.0]
+                                      : [NSColor colorWithCalibratedRed:0.85 green:1.0 blue:0.85 alpha:1.0])
+                                   : (disconnected
+                                      ? [NSColor colorWithCalibratedRed:0.72 green:0.20 blue:0.20 alpha:1.0]
+                                      : [NSColor colorWithCalibratedRed:0.20 green:0.62 blue:0.20 alpha:1.0])];
 }
 
 @end
@@ -239,6 +244,7 @@ static NSInteger const kSMBEditorErrorTag = 1099;
     [self.bookmarksTable setUsesAlternatingRowBackgroundColors:YES];
     [self.bookmarksTable setDoubleAction:@selector(activateSelectedBookmark:)];
     [self.bookmarksTable addTableColumn:[self bookmarkColumn]];
+    [self syncBookmarkColumnWidth];
     [scrollView setDocumentView:self.bookmarksTable];
 
     self.emptyStateView = [[NSView alloc] initWithFrame:[scrollView frame]];
@@ -312,6 +318,7 @@ static NSInteger const kSMBEditorErrorTag = 1099;
 - (void)windowDidResize:(NSNotification *)notification
 {
     if ([notification object] == self.window) {
+        [self syncBookmarkColumnWidth];
         [self positionEmptyStateSubviews];
     }
 }
@@ -328,6 +335,20 @@ static NSInteger const kSMBEditorErrorTag = 1099;
     (void)notification;
     [self.mountedStateRefreshTimer invalidate];
     self.mountedStateRefreshTimer = nil;
+}
+
+- (void)syncBookmarkColumnWidth
+{
+    NSTableColumn *column = [[self.bookmarksTable tableColumns] count] > 0
+        ? [[self.bookmarksTable tableColumns] objectAtIndex:0]
+        : nil;
+    CGFloat width = [[[self.bookmarksTable enclosingScrollView] contentView] bounds].size.width;
+
+    if (!column || width <= 0.0) {
+        return;
+    }
+
+    [column setWidth:width];
 }
 
 - (void)installMainMenu
@@ -513,6 +534,7 @@ static NSInteger const kSMBEditorErrorTag = 1099;
 {
     NSTableColumn *column = [[NSTableColumn alloc] initWithIdentifier:@"bookmark"];
     [column setWidth:700.0];
+    [column setResizingMask:NSTableColumnAutoresizingMask];
     return column;
 }
 
@@ -566,7 +588,8 @@ static NSInteger const kSMBEditorErrorTag = 1099;
     [cell.titleField setStringValue:title];
     [cell.subtitleField setStringValue:[bookmark subtitleText] ?: @""];
     [cell.detailField setStringValue:[bookmark detailText] ?: @""];
-    [cell.mountedField setStringValue:[mountpoint length] > 0 ? @"Connected" : @""];
+    [cell.mountedField setStringValue:[mountpoint length] > 0 ? @"Connected" : @"Not connected"];
+    [cell updateTextColors];
 
     return cell;
 }
@@ -2141,6 +2164,7 @@ static NSInteger const kSMBEditorErrorTag = 1099;
 
 - (void)reloadBookmarkList
 {
+    [self syncBookmarkColumnWidth];
     [self.bookmarksTable reloadData];
     [self refreshButtons];
     [self refreshCount];
