@@ -1287,9 +1287,6 @@ static NSInteger const kSMBEditorErrorTag = 1099;
     NSString *password = nil;
     BOOL shouldRememberPassword = NO;
     NSMutableArray *arguments = nil;
-    NSString *output = nil;
-    NSArray *shares = nil;
-    int status = -1;
 
     if ([server length] == 0) {
         [self setEditorField:serverField invalid:YES];
@@ -1338,12 +1335,13 @@ static NSInteger const kSMBEditorErrorTag = 1099;
                             arguments:arguments
                           stdinString:password
                            completion:^(int asyncStatus, NSString *asyncOutput) {
+        NSString *output = asyncOutput ?: @"";
+        NSArray *shares = nil;
+
         self.editorBrowseInProgress = NO;
         [(NSButton *)sender setEnabled:YES];
 
-        output = asyncOutput;
-        status = asyncStatus;
-        if (status != 0) {
+        if (asyncStatus != 0) {
             [self showTextPanelWithTitle:@"Share Listing Failed" text:output];
             [errorLabel setStringValue:@"Could not list shares for that server."];
             return;
