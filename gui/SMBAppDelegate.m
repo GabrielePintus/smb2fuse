@@ -1034,11 +1034,10 @@ static NSInteger const kSMBEditorErrorTag = 1099;
         return;
     }
 
-    if ([[NSWorkspace sharedWorkspace] selectFile:mountpoint
-                        inFileViewerRootedAtPath:[mountpoint stringByDeletingLastPathComponent]]) {
-        [self setStatus:[NSString stringWithFormat:@"Revealed %@ in Finder.", [self bookmarkDisplayName:bookmark]]];
+    if ([[NSWorkspace sharedWorkspace] openFile:mountpoint]) {
+        [self setStatus:[NSString stringWithFormat:@"Opened %@ mount point in Finder.", [self bookmarkDisplayName:bookmark]]];
     } else {
-        [self setStatus:@"Finder could not reveal the mount point."];
+        [self setStatus:@"Finder could not open the mount point."];
     }
 }
 
