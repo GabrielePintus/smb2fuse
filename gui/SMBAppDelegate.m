@@ -169,7 +169,6 @@ static NSInteger const kSMBEditorErrorTag = 1099;
 @property (strong) NSMutableArray *bookmarks;
 @property (strong) SMBTaskRunner *taskRunner;
 @property (strong) SMBKeychainStore *keychainStore;
-@property (strong) NSTimer *mountedStateRefreshTimer;
 @property (assign) BOOL taskRunning;
 @property (assign) BOOL refreshInProgress;
 @property (assign) BOOL refreshPending;
@@ -189,11 +188,11 @@ static NSInteger const kSMBEditorErrorTag = 1099;
     [self loadBookmarks];
     [self installMainMenu];
     [self buildWindow];
+    [self installWorkspaceObservers];
     [self.bookmarksTable reloadData];
     [self refreshCount];
     [self rebuildBookmarksMenu];
     [self updateEmptyState];
-    [self startMountedStateRefreshTimer];
     [self requestMountedStateRefresh];
     [self.window center];
     [self.window makeKeyAndOrderFront:nil];
@@ -333,8 +332,27 @@ static NSInteger const kSMBEditorErrorTag = 1099;
 - (void)applicationWillTerminate:(NSNotification *)notification
 {
     (void)notification;
-    [self.mountedStateRefreshTimer invalidate];
-    self.mountedStateRefreshTimer = nil;
+    [[[NSWorkspace sharedWorkspace] notificationCenter] removeObserver:self];
+}
+
+- (void)installWorkspaceObservers
+{
+    NSNotificationCenter *workspaceCenter = [[NSWorkspace sharedWorkspace] notificationCenter];
+
+    [workspaceCenter addObserver:self
+                        selector:@selector(handleWorkspaceMountChange:)
+                            name:NSWorkspaceDidMountNotification
+                          object:nil];
+    [workspaceCenter addObserver:self
+                        selector:@selector(handleWorkspaceMountChange:)
+                            name:NSWorkspaceDidUnmountNotification
+                          object:nil];
+}
+
+- (void)handleWorkspaceMountChange:(NSNotification *)notification
+{
+    (void)notification;
+    [self requestMountedStateRefresh];
 }
 
 - (void)syncBookmarkColumnWidth
@@ -2170,32 +2188,6 @@ static NSInteger const kSMBEditorErrorTag = 1099;
     [self refreshCount];
     [self rebuildBookmarksMenu];
     [self updateEmptyState];
-}
-
-- (void)startMountedStateRefreshTimer
-{
-    if (self.mountedStateRefreshTimer) {
-        return;
-    }
-
-    self.mountedStateRefreshTimer = [NSTimer scheduledTimerWithTimeInterval:5.0
-                                                                     target:self
-                                                                   selector:@selector(handleMountedStateRefreshTimer:)
-                                                                   userInfo:nil
-                                                                    repeats:YES];
-}
-
-- (void)handleMountedStateRefreshTimer:(NSTimer *)timer
-{
-    if (timer != self.mountedStateRefreshTimer) {
-        return;
-    }
-
-    if (![NSApp isActive] || ![self.window isVisible]) {
-        return;
-    }
-
-    [self requestMountedStateRefresh];
 }
 
 - (void)requestMountedStateRefresh
