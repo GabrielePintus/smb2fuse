@@ -159,9 +159,22 @@ static NSInteger const kSMBEditorErrorTag = 1099;
 
 @interface SMBBookmarkTableView : NSTableView
 
+@property (assign) NSInteger contextualRow;
+
 @end
 
 @implementation SMBBookmarkTableView
+
+- (id)initWithFrame:(NSRect)frameRect
+{
+    self = [super initWithFrame:frameRect];
+    if (!self) {
+        return nil;
+    }
+
+    self.contextualRow = -1;
+    return self;
+}
 
 - (NSMenu *)menuForEvent:(NSEvent *)event
 {
@@ -169,10 +182,12 @@ static NSInteger const kSMBEditorErrorTag = 1099;
     NSInteger row = [self rowAtPoint:point];
 
     if (row < 0) {
+        self.contextualRow = -1;
         [self deselectAll:nil];
         return nil;
     }
 
+    self.contextualRow = row;
     if (![self isRowSelected:row]) {
         [self selectRowIndexes:[NSIndexSet indexSetWithIndex:(NSUInteger)row] byExtendingSelection:NO];
     }
@@ -682,6 +697,9 @@ static NSInteger const kSMBEditorErrorTag = 1099;
 - (void)tableViewSelectionDidChange:(NSNotification *)notification
 {
     (void)notification;
+    if ([self.bookmarksTable isKindOfClass:[SMBBookmarkTableView class]]) {
+        [(SMBBookmarkTableView *)self.bookmarksTable setContextualRow:[self.bookmarksTable selectedRow]];
+    }
     [self refreshButtons];
 }
 
@@ -896,6 +914,7 @@ static NSInteger const kSMBEditorErrorTag = 1099;
     }
 
     SMBConnection *bookmark = [self selectedBookmark];
+    NSInteger row = [self selectedBookmarkRow];
     if (!bookmark) {
         [self setStatus:@"Select a connection first."];
         return;
@@ -956,7 +975,7 @@ static NSInteger const kSMBEditorErrorTag = 1099;
                 [self showTextPanelWithTitle:@"Visible Shares" text:@"No browseable shares were returned."];
                 [self setStatus:@"No shares were returned."];
             } else {
-                [self chooseShareFromArray:shares forBookmarkAtRow:[self selectedBookmarkRow]];
+                [self chooseShareFromArray:shares forBookmarkAtRow:row];
             }
         } else {
             [self showTextPanelWithTitle:@"Share Listing Failed" text:output];
@@ -1015,8 +1034,12 @@ static NSInteger const kSMBEditorErrorTag = 1099;
         return;
     }
 
-    [[NSWorkspace sharedWorkspace] selectFile:mountpoint inFileViewerRootedAtPath:@""];
-    [self setStatus:[NSString stringWithFormat:@"Revealed %@ in Finder.", [self bookmarkDisplayName:bookmark]]];
+    if ([[NSWorkspace sharedWorkspace] selectFile:mountpoint
+                        inFileViewerRootedAtPath:[mountpoint stringByDeletingLastPathComponent]]) {
+        [self setStatus:[NSString stringWithFormat:@"Revealed %@ in Finder.", [self bookmarkDisplayName:bookmark]]];
+    } else {
+        [self setStatus:@"Finder could not reveal the mount point."];
+    }
 }
 
 - (IBAction)showAboutPanel:(id)sender
@@ -2359,8 +2382,17 @@ static NSInteger const kSMBEditorErrorTag = 1099;
 - (NSInteger)selectedBookmarkRow
 {
     NSInteger row = [self.bookmarksTable selectedRow];
+    NSInteger contextualRow = -1;
+
+    if ([self.bookmarksTable isKindOfClass:[SMBBookmarkTableView class]]) {
+        contextualRow = [(SMBBookmarkTableView *)self.bookmarksTable contextualRow];
+    }
+
     if (row < 0 || row >= (NSInteger)[self.bookmarks count]) {
-        return -1;
+        if (contextualRow < 0 || contextualRow >= (NSInteger)[self.bookmarks count]) {
+            return -1;
+        }
+        return contextualRow;
     }
     return row;
 }
