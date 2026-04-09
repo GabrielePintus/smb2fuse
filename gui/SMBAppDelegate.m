@@ -82,24 +82,24 @@ static NSInteger const kSMBEditorErrorTag = 1099;
     [self.bookmarkIconView setImageScaling:NSImageScaleProportionallyUpOrDown];
     [self addSubview:self.bookmarkIconView];
 
-    self.titleField = [self labelWithFrame:NSMakeRect(62.0, 40.0, frameRect.size.width - 120.0, 18.0)
+    self.titleField = [self labelWithFrame:NSMakeRect(62.0, 40.0, frameRect.size.width - 170.0, 18.0)
                                       bold:YES
                                       size:14.0];
     [self addSubview:self.titleField];
 
-    self.subtitleField = [self labelWithFrame:NSMakeRect(62.0, 23.0, frameRect.size.width - 120.0, 16.0)
+    self.subtitleField = [self labelWithFrame:NSMakeRect(62.0, 23.0, frameRect.size.width - 170.0, 16.0)
                                          bold:NO
                                          size:12.0];
     [self.subtitleField setTextColor:[NSColor darkGrayColor]];
     [self addSubview:self.subtitleField];
 
-    self.detailField = [self labelWithFrame:NSMakeRect(62.0, 8.0, frameRect.size.width - 120.0, 14.0)
+    self.detailField = [self labelWithFrame:NSMakeRect(62.0, 8.0, frameRect.size.width - 170.0, 14.0)
                                        bold:NO
                                        size:11.0];
     [self.detailField setTextColor:[NSColor grayColor]];
     [self addSubview:self.detailField];
 
-    self.mountedField = [self labelWithFrame:NSMakeRect(frameRect.size.width - 90.0, 21.0, 76.0, 20.0)
+    self.mountedField = [self labelWithFrame:NSMakeRect(frameRect.size.width - 118.0, 21.0, 104.0, 20.0)
                                         bold:NO
                                         size:12.0];
     [self.mountedField setAlignment:NSRightTextAlignment];
@@ -114,10 +114,10 @@ static NSInteger const kSMBEditorErrorTag = 1099;
     [super layout];
 
     CGFloat width = [self bounds].size.width;
-    [self.titleField setFrame:NSMakeRect(62.0, 40.0, width - 154.0, 18.0)];
-    [self.subtitleField setFrame:NSMakeRect(62.0, 23.0, width - 154.0, 16.0)];
-    [self.detailField setFrame:NSMakeRect(62.0, 8.0, width - 154.0, 14.0)];
-    [self.mountedField setFrame:NSMakeRect(width - 90.0, 21.0, 76.0, 20.0)];
+    [self.titleField setFrame:NSMakeRect(62.0, 40.0, width - 182.0, 18.0)];
+    [self.subtitleField setFrame:NSMakeRect(62.0, 23.0, width - 182.0, 16.0)];
+    [self.detailField setFrame:NSMakeRect(62.0, 8.0, width - 182.0, 14.0)];
+    [self.mountedField setFrame:NSMakeRect(width - 118.0, 21.0, 104.0, 20.0)];
 }
 
 - (void)setBackgroundStyle:(NSBackgroundStyle)backgroundStyle
@@ -164,6 +164,7 @@ static NSInteger const kSMBEditorErrorTag = 1099;
 @property (strong) NSMutableArray *bookmarks;
 @property (strong) SMBTaskRunner *taskRunner;
 @property (strong) SMBKeychainStore *keychainStore;
+@property (strong) NSTimer *mountedStateRefreshTimer;
 @property (assign) BOOL taskRunning;
 @property (assign) BOOL refreshInProgress;
 @property (assign) BOOL refreshPending;
@@ -187,6 +188,7 @@ static NSInteger const kSMBEditorErrorTag = 1099;
     [self refreshCount];
     [self rebuildBookmarksMenu];
     [self updateEmptyState];
+    [self startMountedStateRefreshTimer];
     [self requestMountedStateRefresh];
     [self.window center];
     [self.window makeKeyAndOrderFront:nil];
@@ -196,7 +198,7 @@ static NSInteger const kSMBEditorErrorTag = 1099;
 - (void)applicationDidBecomeActive:(NSNotification *)notification
 {
     (void)notification;
-    [self reloadBookmarkList];
+    [self requestMountedStateRefresh];
 }
 
 - (BOOL)applicationShouldTerminateAfterLastWindowClosed:(NSApplication *)sender
@@ -317,8 +319,15 @@ static NSInteger const kSMBEditorErrorTag = 1099;
 - (void)windowDidBecomeKey:(NSNotification *)notification
 {
     if ([notification object] == self.window) {
-        [self reloadBookmarkList];
+        [self requestMountedStateRefresh];
     }
+}
+
+- (void)applicationWillTerminate:(NSNotification *)notification
+{
+    (void)notification;
+    [self.mountedStateRefreshTimer invalidate];
+    self.mountedStateRefreshTimer = nil;
 }
 
 - (void)installMainMenu
@@ -2137,6 +2146,32 @@ static NSInteger const kSMBEditorErrorTag = 1099;
     [self refreshCount];
     [self rebuildBookmarksMenu];
     [self updateEmptyState];
+}
+
+- (void)startMountedStateRefreshTimer
+{
+    if (self.mountedStateRefreshTimer) {
+        return;
+    }
+
+    self.mountedStateRefreshTimer = [NSTimer scheduledTimerWithTimeInterval:5.0
+                                                                     target:self
+                                                                   selector:@selector(handleMountedStateRefreshTimer:)
+                                                                   userInfo:nil
+                                                                    repeats:YES];
+}
+
+- (void)handleMountedStateRefreshTimer:(NSTimer *)timer
+{
+    if (timer != self.mountedStateRefreshTimer) {
+        return;
+    }
+
+    if (![NSApp isActive] || ![self.window isVisible]) {
+        return;
+    }
+
+    [self requestMountedStateRefresh];
 }
 
 - (void)requestMountedStateRefresh
