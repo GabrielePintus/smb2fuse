@@ -1114,7 +1114,7 @@ static NSInteger const kSMBEditorErrorTag = 1099;
 - (void)openEditorForBookmark:(SMBConnection *)bookmark atIndex:(NSInteger)index
 {
     SMBConnection *source = bookmark ?: [[SMBConnection alloc] init];
-    NSPanel *panel = [[NSPanel alloc] initWithContentRect:NSMakeRect(0.0, 0.0, 390.0, 286.0)
+    NSPanel *panel = [[NSPanel alloc] initWithContentRect:NSMakeRect(0.0, 0.0, 390.0, 320.0)
                                                 styleMask:(NSTitledWindowMask | NSClosableWindowMask)
                                                   backing:NSBackingStoreBuffered
                                                     defer:NO];
@@ -1123,14 +1123,14 @@ static NSInteger const kSMBEditorErrorTag = 1099;
     [panel setTitle:index >= 0 ? @"Edit Connection" : @"New Connection"];
     [panel center];
 
-    [self editorFieldInView:contentView title:@"Name" y:208.0 value:source.name hint:@"Office NAS" tag:kSMBEditorNameTag];
-    [self editorFieldInView:contentView title:@"Server" y:174.0 value:source.server hint:@"server.local or 192.168.1.52" tag:kSMBEditorServerTag];
-    [self editorFieldInView:contentView title:@"User" y:140.0 value:source.user hint:@"Optional username" tag:kSMBEditorUserTag];
-    [self editorShareFieldInView:contentView y:106.0 value:source.share hint:@"SharedFolder"];
-    [self editorFieldInView:contentView title:@"Domain" y:72.0 value:source.domain hint:@"Optional domain" tag:kSMBEditorDomainTag];
+    [self editorFieldInView:contentView title:@"Name" y:242.0 value:source.name hint:@"Office NAS" tag:kSMBEditorNameTag];
+    [self editorFieldInView:contentView title:@"Server" y:208.0 value:source.server hint:@"server.local or 192.168.1.52" tag:kSMBEditorServerTag];
+    [self editorFieldInView:contentView title:@"User" y:174.0 value:source.user hint:@"Optional username" tag:kSMBEditorUserTag];
+    [self editorShareFieldInView:contentView y:140.0 value:source.share hint:@"SharedFolder"];
+    [self editorFieldInView:contentView title:@"Domain" y:106.0 value:source.domain hint:@"Optional domain" tag:kSMBEditorDomainTag];
 
     NSTextField *passwordState = [self labelWithString:@""
-                                                 frame:NSMakeRect(18.0, 56.0, 220.0, 16.0)
+                                                 frame:NSMakeRect(18.0, 78.0, 220.0, 16.0)
                                                   bold:NO];
     [passwordState setTag:kSMBEditorPasswordStateTag];
     [passwordState setTextColor:[NSColor grayColor]];
@@ -1138,13 +1138,13 @@ static NSInteger const kSMBEditorErrorTag = 1099;
     [contentView addSubview:passwordState];
 
     NSButton *forgetPasswordButton = [self buttonWithTitle:@"Forget Saved Password"
-                                                     frame:NSMakeRect(242.0, 50.0, 134.0, 24.0)
+                                                     frame:NSMakeRect(242.0, 72.0, 134.0, 24.0)
                                                     action:@selector(forgetSavedPasswordFromEditor:)];
     [forgetPasswordButton setTag:kSMBEditorForgetPasswordTag];
     [contentView addSubview:forgetPasswordButton];
 
     NSTextField *errorLabel = [self labelWithString:@""
-                                              frame:NSMakeRect(18.0, 32.0, 354.0, 18.0)
+                                              frame:NSMakeRect(18.0, 50.0, 354.0, 18.0)
                                                bold:NO];
     [errorLabel setTag:kSMBEditorErrorTag];
     [errorLabel setTextColor:[NSColor colorWithCalibratedRed:0.74 green:0.14 blue:0.14 alpha:1.0]];
@@ -1152,7 +1152,7 @@ static NSInteger const kSMBEditorErrorTag = 1099;
     [contentView addSubview:errorLabel];
 
     NSTextField *note = [self labelWithString:@"Passwords are stored in your Mac keychain and are never exported."
-                                        frame:NSMakeRect(18.0, 16.0, 354.0, 16.0)
+                                        frame:NSMakeRect(18.0, 28.0, 354.0, 16.0)
                                          bold:NO];
     [note setTextColor:[NSColor grayColor]];
     [note setFont:[NSFont systemFontOfSize:11.0]];
