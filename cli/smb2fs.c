@@ -105,7 +105,14 @@ struct smb2fs_handle {
     struct smb2fh *fh;
     int open_flags;
     char *path;
+    uint64_t write_bytes;
+    uint64_t write_calls;
+    uint64_t write_submits;
+    size_t max_write_request;
+    int max_write_in_flight;
 };
+
+static int smb2fs_perf_log = 0;
 
 static void smb2fs_secure_free(char **ptr, size_t len)
 {
@@ -1239,6 +1246,8 @@ static int smb2fs_prepare_password(int *password_from_argv_out,
 
 static int smb2fs_create_context(void)
 {
+    smb2fs_perf_log = (getenv("SMB2FS_PERF") != NULL);
+
     smb2_ctx = smb2_init_context();
     if (!smb2_ctx) {
         fprintf(stderr, "Failed to init smb2 context\n");
@@ -1720,6 +1729,10 @@ static int smb2fs_write(const char *path, const char *buf, size_t size,
 
     max_write_size = smb2_get_max_write_size(smb2_ctx);
     memset(&state, 0, sizeof(state));
+    handle->write_calls++;
+    handle->write_bytes += (uint64_t)size;
+    if (size > handle->max_write_request)
+        handle->max_write_request = size;
 
     while (done < size) {
         uint32_t io_size = smb2fs_io_size(size - done, max_write_size);
@@ -1755,6 +1768,9 @@ static int smb2fs_write(const char *path, const char *buf, size_t size,
         }
 
         state.in_flight++;
+        handle->write_submits++;
+        if (state.in_flight > handle->max_write_in_flight)
+            handle->max_write_in_flight = state.in_flight;
         done += (size_t)io_size;
     }
 
@@ -1843,6 +1859,18 @@ static int smb2fs_release(const char *path, struct fuse_file_info *fi)
     handle = smb2fs_handle_from_fi(fi);
     if (!handle)
         return -EBADF;
+
+    if (smb2fs_perf_log && handle->write_calls > 0) {
+        fprintf(stderr,
+                "smb2fs perf: %s write_bytes=%llu write_calls=%llu "
+                "max_fuse_write=%zu smb_submits=%llu max_in_flight=%d\n",
+                handle->path ? handle->path : path,
+                (unsigned long long)handle->write_bytes,
+                (unsigned long long)handle->write_calls,
+                handle->max_write_request,
+                (unsigned long long)handle->write_submits,
+                handle->max_write_in_flight);
+    }
 
     ret = smb2_close(smb2_ctx, handle->fh);
     free(handle->path);
