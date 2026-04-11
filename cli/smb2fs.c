@@ -58,6 +58,7 @@
 static struct smb2_context *smb2_ctx = NULL;
 static struct fuse_operations smb2fs_ops;
 static int smb2fs_perf_log = 0;
+static int smb2fs_trace_log = 0;
 static FILE *smb2fs_perf_stream = NULL;
 
 /* Securely zero memory without compiler elision. */
@@ -93,23 +94,36 @@ static int smb2fs_result(int rc)
 static int smb2fs_perf_init(void)
 {
     const char *perf = getenv("SMB2FS_PERF");
+    const char *trace = getenv("SMB2FS_TRACE");
+    const char *log_path = NULL;
 
     smb2fs_perf_log = 0;
+    smb2fs_trace_log = 0;
     smb2fs_perf_stream = NULL;
 
-    if (!perf || *perf == '\0' || strcmp(perf, "0") == 0)
+    if (trace && *trace != '\0' && strcmp(trace, "0") != 0)
+        smb2fs_trace_log = 1;
+
+    if (perf && *perf != '\0' && strcmp(perf, "0") != 0)
+        smb2fs_perf_log = 1;
+
+    if (!smb2fs_perf_log && !smb2fs_trace_log)
         return 0;
 
-    smb2fs_perf_log = 1;
-    if (strcmp(perf, "1") == 0) {
+    if (smb2fs_perf_log && strcmp(perf, "1") != 0)
+        log_path = perf;
+    else if (smb2fs_trace_log && strcmp(trace, "1") != 0)
+        log_path = trace;
+
+    if (!log_path) {
         smb2fs_perf_stream = stderr;
         return 0;
     }
 
-    smb2fs_perf_stream = fopen(perf, "a");
+    smb2fs_perf_stream = fopen(log_path, "a");
     if (!smb2fs_perf_stream) {
-        fprintf(stderr, "Warning: could not open SMB2FS_PERF log '%s': %s\n",
-                perf, strerror(errno));
+        fprintf(stderr, "Warning: could not open smb2fs log '%s': %s\n",
+                log_path, strerror(errno));
         smb2fs_perf_stream = stderr;
         return -1;
     }
@@ -124,6 +138,7 @@ static void smb2fs_perf_close(void)
         fclose(smb2fs_perf_stream);
     smb2fs_perf_stream = NULL;
     smb2fs_perf_log = 0;
+    smb2fs_trace_log = 0;
 }
 
 static void smb2fs_perf_printf(const char *fmt, ...)
@@ -131,6 +146,19 @@ static void smb2fs_perf_printf(const char *fmt, ...)
     va_list ap;
 
     if (!smb2fs_perf_log || !smb2fs_perf_stream)
+        return;
+
+    va_start(ap, fmt);
+    vfprintf(smb2fs_perf_stream, fmt, ap);
+    va_end(ap);
+    fflush(smb2fs_perf_stream);
+}
+
+static void smb2fs_trace_printf(const char *fmt, ...)
+{
+    va_list ap;
+
+    if (!smb2fs_trace_log || !smb2fs_perf_stream)
         return;
 
     va_start(ap, fmt);
@@ -1636,6 +1664,30 @@ static int smb2fs_fgetattr(const char *path, struct stat *stbuf,
     return 0;
 }
 
+static int smb2fs_access(const char *path, int mask)
+{
+    const char *smb_path = smb2path(path);
+    struct smb2_stat_64 st;
+    int ret;
+
+    if (!smb_path) {
+        smb2fs_trace_printf("smb2fs trace: access path=%s mask=0x%x ret=%d\n",
+                            path ? path : "(null)", mask, -EINVAL);
+        return -EINVAL;
+    }
+
+    ret = (strcmp(path, "/") == 0) ? 0 : smb2_stat(smb2_ctx, smb_path, &st);
+    if (ret < 0) {
+        smb2fs_trace_printf("smb2fs trace: access path=%s mask=0x%x ret=%d\n",
+                            path, mask, ret);
+        return ret;
+    }
+
+    smb2fs_trace_printf("smb2fs trace: access path=%s mask=0x%x ret=0\n",
+                        path, mask);
+    return 0;
+}
+
 static int smb2fs_chmod(const char *path, mode_t mode)
 {
     const char *smb_path = smb2path(path);
@@ -1644,6 +1696,8 @@ static int smb2fs_chmod(const char *path, mode_t mode)
     if (!smb_path)
         return -EINVAL;
 
+    smb2fs_trace_printf("smb2fs trace: chmod path=%s mode=0%o ret=0\n",
+                        path, (unsigned int)mode);
     return 0;
 }
 
@@ -1656,6 +1710,8 @@ static int smb2fs_chown(const char *path, uid_t uid, gid_t gid)
     if (!smb_path)
         return -EINVAL;
 
+    smb2fs_trace_printf("smb2fs trace: chown path=%s uid=%lu gid=%lu ret=0\n",
+                        path, (unsigned long)uid, (unsigned long)gid);
     return 0;
 }
 
@@ -1667,6 +1723,7 @@ static int smb2fs_utimens(const char *path, const struct timespec tv[2])
     if (!smb_path)
         return -EINVAL;
 
+    smb2fs_trace_printf("smb2fs trace: utimens path=%s ret=0\n", path);
     return 0;
 }
 
@@ -1713,6 +1770,8 @@ static int smb2fs_open(const char *path, struct fuse_file_info *fi)
 
     flags = smb2fs_supported_open_flags(fi->flags, O_RDONLY, 0);
     ret = smb2fs_open_handle(smb_path, fi, flags);
+    smb2fs_trace_printf("smb2fs trace: open path=%s fuse_flags=0x%x smb_flags=0x%x initial_ret=%d\n",
+                        path, fi ? fi->flags : 0, flags, ret);
 
     if (ret < 0 && (flags & O_TRUNC) &&
         ((ret == -EACCES) || (ret == -EPERM))) {
@@ -1722,12 +1781,20 @@ static int smb2fs_open(const char *path, struct fuse_file_info *fi)
         ret = smb2fs_open_handle(smb_path, fi, flags & ~O_TRUNC);
         if (ret == 0) {
             handle = smb2fs_handle_from_fi(fi);
-            if (!handle)
+            if (!handle) {
+                smb2fs_trace_printf("smb2fs trace: open path=%s ret=%d missing_handle_after_retry\n",
+                                    path, -EBADF);
                 return -EBADF;
+            }
 
             trunc_ret = smb2_ftruncate(smb2_ctx, handle->fh, 0);
-            if (trunc_ret == 0)
+            smb2fs_trace_printf("smb2fs trace: open path=%s retry_without_trunc_ret=0 ftruncate_ret=%d\n",
+                                path, trunc_ret);
+            if (trunc_ret == 0) {
+                smb2fs_trace_printf("smb2fs trace: open path=%s ret=0 fallback=ftruncate\n",
+                                    path);
                 return 0;
+            }
 
             smb2fs_close_fi_handle(fi);
             ret = trunc_ret;
@@ -1735,12 +1802,17 @@ static int smb2fs_open(const char *path, struct fuse_file_info *fi)
 
         if (ret < 0) {
             ret = smb2fs_recreate_empty_file(smb_path);
+            smb2fs_trace_printf("smb2fs trace: open path=%s recreate_ret=%d\n",
+                                path, ret);
             if (ret < 0)
                 return ret;
             ret = smb2fs_open_handle(smb_path, fi, flags | O_CREAT);
+            smb2fs_trace_printf("smb2fs trace: open path=%s open_after_recreate_ret=%d\n",
+                                path, ret);
         }
     }
 
+    smb2fs_trace_printf("smb2fs trace: open path=%s ret=%d\n", path, ret);
     return ret;
 }
 
@@ -1748,6 +1820,7 @@ static int smb2fs_create(const char *path, mode_t mode, struct fuse_file_info *f
 {
     const char *smb_path = smb2path(path);
     int flags;
+    int ret;
 
     (void)mode;
 
@@ -1758,7 +1831,10 @@ static int smb2fs_create(const char *path, mode_t mode, struct fuse_file_info *f
         return -EINVAL;
 
     flags = smb2fs_supported_open_flags(fi->flags, O_WRONLY, 1);
-    return smb2fs_open_handle(smb_path, fi, flags);
+    ret = smb2fs_open_handle(smb_path, fi, flags);
+    smb2fs_trace_printf("smb2fs trace: create path=%s fuse_flags=0x%x smb_flags=0x%x ret=%d\n",
+                        path, fi ? fi->flags : 0, flags, ret);
+    return ret;
 }
 
 static int smb2fs_read(const char *path, char *buf, size_t size, off_t offset,
@@ -2001,34 +2077,51 @@ static int smb2fs_truncate(const char *path, off_t size)
         return -EINVAL;
 
     ret = smb2fs_result(smb2_truncate(smb2_ctx, smb_path, (uint64_t)size));
+    smb2fs_trace_printf("smb2fs trace: truncate path=%s size=%lld initial_ret=%d\n",
+                        path, (long long)size, ret);
     if (ret == 0 || size != 0)
         return ret;
 
-    return smb2fs_recreate_empty_file(smb_path);
+    ret = smb2fs_recreate_empty_file(smb_path);
+    smb2fs_trace_printf("smb2fs trace: truncate path=%s size=%lld recreate_ret=%d\n",
+                        path, (long long)size, ret);
+    return ret;
 }
 
 static int smb2fs_ftruncate(const char *path, off_t size,
                             struct fuse_file_info *fi)
 {
     struct smb2fs_handle *handle;
+    int ret;
 
     if (size < 0)
         return -EINVAL;
 
     handle = smb2fs_handle_from_fi(fi);
-    if (!handle)
-        return smb2fs_truncate(path, size);
+    if (!handle) {
+        ret = smb2fs_truncate(path, size);
+        smb2fs_trace_printf("smb2fs trace: ftruncate path=%s size=%lld via_path_ret=%d\n",
+                            path ? path : "(null)", (long long)size, ret);
+        return ret;
+    }
 
-    return smb2fs_result(smb2_ftruncate(smb2_ctx, handle->fh, (uint64_t)size));
+    ret = smb2fs_result(smb2_ftruncate(smb2_ctx, handle->fh, (uint64_t)size));
+    smb2fs_trace_printf("smb2fs trace: ftruncate path=%s size=%lld ret=%d\n",
+                        path ? path : "(null)", (long long)size, ret);
+    return ret;
 }
 
 static int smb2fs_unlink(const char *path)
 {
     const char *smb_path = smb2path(path);
+    int ret;
+
     if (!smb_path)
         return -EINVAL;
 
-    return smb2fs_result(smb2_unlink(smb2_ctx, smb_path));
+    ret = smb2fs_result(smb2_unlink(smb2_ctx, smb_path));
+    smb2fs_trace_printf("smb2fs trace: unlink path=%s ret=%d\n", path, ret);
+    return ret;
 }
 
 static int smb2fs_mkdir(const char *path, mode_t mode)
@@ -2082,6 +2175,7 @@ static struct fuse_operations smb2fs_ops = {
     .init     = smb2fs_init,
     .getattr  = smb2fs_getattr,
     .readdir  = smb2fs_readdir,
+    .access   = smb2fs_access,
     .chmod    = smb2fs_chmod,
     .chown    = smb2fs_chown,
     .utimens  = smb2fs_utimens,
