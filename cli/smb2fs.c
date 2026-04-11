@@ -37,6 +37,7 @@
 #include <errno.h>
 #include <limits.h>
 #include <fcntl.h>
+#include <poll.h>
 #include <sys/stat.h>
 #include <unistd.h>
 
@@ -49,7 +50,9 @@
 #define ENOTSUP EOPNOTSUPP
 #endif
 
-#define SMB2FS_DEFAULT_IOSIZE "1048576"
+#define SMB2FS_DEFAULT_IOSIZE "8388608"
+#define SMB2FS_MAX_ASYNC_WRITES 32
+#define SMB2FS_MAX_ASYNC_WRITE_SIZE (256 * 1024)
 
 static struct smb2_context *smb2_ctx = NULL;
 static struct fuse_operations smb2fs_ops;
@@ -1391,6 +1394,92 @@ static int smb2fs_transfer_fits_fuse_result(size_t size)
     return 0;
 }
 
+struct smb2fs_async_write_state {
+    int in_flight;
+    int error;
+};
+
+struct smb2fs_async_write_req {
+    struct smb2fs_async_write_state *state;
+    uint32_t expected;
+};
+
+static void smb2fs_async_write_cb(struct smb2_context *smb2, int status,
+                                  void *command_data, void *cb_data)
+{
+    struct smb2fs_async_write_req *req = cb_data;
+    struct smb2fs_async_write_state *state = req ? req->state : NULL;
+    (void)smb2;
+    (void)command_data;
+
+    if (!state) {
+        free(req);
+        return;
+    }
+
+    if (status < 0 && state->error == 0) {
+        state->error = status;
+    } else if ((uint32_t)status != req->expected && state->error == 0) {
+        state->error = -EIO;
+    }
+
+    if (state->in_flight > 0)
+        state->in_flight--;
+
+    free(req);
+}
+
+static int smb2fs_service_until_write_slot(struct smb2fs_async_write_state *state,
+                                           int max_in_flight)
+{
+    while (state->error == 0 && state->in_flight >= max_in_flight) {
+        struct pollfd pfd;
+
+        memset(&pfd, 0, sizeof(pfd));
+        pfd.fd = smb2_get_fd(smb2_ctx);
+        if (pfd.fd < 0)
+            return -EIO;
+        pfd.events = smb2_which_events(smb2_ctx);
+
+        if (poll(&pfd, 1, 1000) < 0) {
+            if (errno == EINTR)
+                continue;
+            return -EIO;
+        }
+        if (pfd.revents == 0)
+            continue;
+        if (smb2_service(smb2_ctx, pfd.revents) < 0)
+            return smb2fs_errno();
+    }
+
+    return state->error;
+}
+
+static int smb2fs_drain_async_writes(struct smb2fs_async_write_state *state)
+{
+    while (state->in_flight > 0) {
+        struct pollfd pfd;
+
+        memset(&pfd, 0, sizeof(pfd));
+        pfd.fd = smb2_get_fd(smb2_ctx);
+        if (pfd.fd < 0)
+            return -EIO;
+        pfd.events = smb2_which_events(smb2_ctx);
+
+        if (poll(&pfd, 1, 1000) < 0) {
+            if (errno == EINTR)
+                continue;
+            return -EIO;
+        }
+        if (pfd.revents == 0)
+            continue;
+        if (smb2_service(smb2_ctx, pfd.revents) < 0)
+            return smb2fs_errno();
+    }
+
+    return state->error;
+}
+
 static int smb2fs_getattr(const char *path, struct stat *stbuf)
 {
     const char *smb_path;
@@ -1584,7 +1673,9 @@ static int smb2fs_write(const char *path, const char *buf, size_t size,
     uint32_t max_write_size;
     struct smb2fs_handle *handle;
     struct smb2_stat_64 st;
+    struct smb2fs_async_write_state state;
     uint64_t write_offset;
+    int ret = 0;
     (void)path;
     if (size == 0)
         return 0;
@@ -1610,26 +1701,52 @@ static int smb2fs_write(const char *path, const char *buf, size_t size,
     }
 
     max_write_size = smb2_get_max_write_size(smb2_ctx);
+    memset(&state, 0, sizeof(state));
 
     while (done < size) {
         uint32_t io_size = smb2fs_io_size(size - done, max_write_size);
-        int ret;
+        struct smb2fs_async_write_req *req;
 
+        ret = smb2fs_service_until_write_slot(&state, SMB2FS_MAX_ASYNC_WRITES);
+        if (ret < 0)
+            break;
         if (io_size == 0)
             break;
-        if (write_offset > UINT64_MAX - (uint64_t)done)
-            return -EOVERFLOW;
+        if (io_size > SMB2FS_MAX_ASYNC_WRITE_SIZE)
+            io_size = SMB2FS_MAX_ASYNC_WRITE_SIZE;
+        if (write_offset > UINT64_MAX - (uint64_t)done) {
+            ret = -EOVERFLOW;
+            break;
+        }
 
-        ret = smb2_pwrite(smb2_ctx, handle->fh,
-                          (const uint8_t *)buf + done, io_size,
-                          write_offset + (uint64_t)done);
-        if (ret < 0)
-            return ret;
-        if (ret == 0)
-            return done > 0 ? (int)done : -EIO;
+        req = calloc(1, sizeof(*req));
+        if (!req) {
+            ret = -ENOMEM;
+            break;
+        }
+        req->state = &state;
+        req->expected = io_size;
 
-        done += (size_t)ret;
+        ret = smb2_pwrite_async(smb2_ctx, handle->fh,
+                                (const uint8_t *)buf + done, io_size,
+                                write_offset + (uint64_t)done,
+                                smb2fs_async_write_cb, req);
+        if (ret < 0) {
+            free(req);
+            break;
+        }
+
+        state.in_flight++;
+        done += (size_t)io_size;
     }
+
+    if (state.in_flight > 0) {
+        int drain_ret = smb2fs_drain_async_writes(&state);
+        if (ret == 0 && drain_ret < 0)
+            ret = drain_ret;
+    }
+    if (ret < 0)
+        return ret;
 
     return (int)done;
 }
