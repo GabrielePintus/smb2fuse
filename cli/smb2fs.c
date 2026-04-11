@@ -55,9 +55,10 @@
 #define SMB2FS_DEFAULT_IOSIZE_BYTES (8 * 1024 * 1024)
 #define SMB2FS_DEFAULT_IOSIZE "8388608"
 #define SMB2FS_MAX_ASYNC_WRITES 32
-#define SMB2FS_MAX_ASYNC_WRITE_SIZE (1024 * 1024)
+#define SMB2FS_DEFAULT_ASYNC_WRITE_SIZE (4 * 1024 * 1024)
+#define SMB2FS_MAX_ASYNC_WRITE_SIZE SMB2FS_DEFAULT_IOSIZE_BYTES
 #define SMB2FS_DEFAULT_WRITE_BUFFER_SIZE \
-    (SMB2FS_MAX_ASYNC_WRITES * SMB2FS_MAX_ASYNC_WRITE_SIZE)
+    (SMB2FS_MAX_ASYNC_WRITES * 1024 * 1024)
 #define SMB2FS_MAX_WRITE_BUFFER_SIZE (128 * 1024 * 1024)
 #ifdef O_DSYNC
 #define SMB2FS_O_DSYNC O_DSYNC
@@ -71,6 +72,7 @@ static struct fuse_operations smb2fs_ops;
 static int smb2fs_perf_log = 0;
 static int smb2fs_trace_log = 0;
 static int smb2fs_write_buffering_enabled = 1;
+static size_t smb2fs_async_write_size = SMB2FS_DEFAULT_ASYNC_WRITE_SIZE;
 static size_t smb2fs_write_buffer_size = SMB2FS_DEFAULT_WRITE_BUFFER_SIZE;
 static FILE *smb2fs_perf_stream = NULL;
 
@@ -125,12 +127,15 @@ static int smb2fs_perf_init(void)
     const char *trace = getenv("SMB2FS_TRACE");
     const char *write_buffer = getenv("SMB2FS_WRITE_BUFFER");
     const char *write_buffer_size = getenv("SMB2FS_WRITE_BUFFER_SIZE");
+    const char *async_write_size = getenv("SMB2FS_ASYNC_WRITE_SIZE");
     const char *log_path = NULL;
     size_t parsed_write_buffer_size;
+    size_t parsed_async_write_size;
 
     smb2fs_perf_log = 0;
     smb2fs_trace_log = 0;
     smb2fs_write_buffering_enabled = 1;
+    smb2fs_async_write_size = SMB2FS_DEFAULT_ASYNC_WRITE_SIZE;
     smb2fs_write_buffer_size = SMB2FS_DEFAULT_WRITE_BUFFER_SIZE;
     smb2fs_perf_stream = NULL;
 
@@ -149,6 +154,13 @@ static int smb2fs_perf_init(void)
         parsed_write_buffer_size >= SMB2FS_MAX_ASYNC_WRITE_SIZE &&
         parsed_write_buffer_size <= SMB2FS_MAX_WRITE_BUFFER_SIZE) {
         smb2fs_write_buffer_size = parsed_write_buffer_size;
+    }
+
+    if (async_write_size &&
+        smb2fs_parse_size(async_write_size, &parsed_async_write_size) == 0 &&
+        parsed_async_write_size >= SMB2FS_MAX_ASYNC_WRITE_SIZE / 8 &&
+        parsed_async_write_size <= SMB2FS_MAX_ASYNC_WRITE_SIZE) {
+        smb2fs_async_write_size = parsed_async_write_size;
     }
 
     if (!smb2fs_perf_log && !smb2fs_trace_log)
@@ -242,6 +254,7 @@ struct smb2fs_handle {
     uint64_t max_backend_write_us;
     size_t max_write_request;
     size_t max_backend_write_request;
+    uint32_t server_max_write_size;
     int max_write_in_flight;
 };
 
@@ -1715,6 +1728,7 @@ static int smb2fs_write_direct(struct smb2fs_handle *handle,
         return -EIO;
 
     max_write_size = smb2_get_max_write_size(smb2_ctx);
+    handle->server_max_write_size = max_write_size;
     memset(&state, 0, sizeof(state));
     start_us = smb2fs_now_us();
     if (size > handle->max_backend_write_request)
@@ -1729,8 +1743,8 @@ static int smb2fs_write_direct(struct smb2fs_handle *handle,
             break;
         if (io_size == 0)
             break;
-        if (io_size > SMB2FS_MAX_ASYNC_WRITE_SIZE)
-            io_size = SMB2FS_MAX_ASYNC_WRITE_SIZE;
+        if (io_size > smb2fs_async_write_size)
+            io_size = (uint32_t)smb2fs_async_write_size;
         if (write_offset > UINT64_MAX - (uint64_t)done) {
             ret = -EOVERFLOW;
             break;
@@ -2415,14 +2429,17 @@ static int smb2fs_release(const char *path, struct fuse_file_info *fi)
         smb2fs_perf_printf(
             "smb2fs perf: %s write_bytes=%llu write_calls=%llu "
             "max_fuse_write=%zu max_backend_write=%zu write_buffer_size=%zu "
-            "smb_submits=%llu max_in_flight=%d buffered_flushes=%llu "
-            "backend_write_ms=%llu max_backend_write_ms=%llu\n",
+            "async_write_size=%zu server_max_write=%u smb_submits=%llu "
+            "max_in_flight=%d buffered_flushes=%llu backend_write_ms=%llu "
+            "max_backend_write_ms=%llu\n",
             handle->path ? handle->path : path,
             (unsigned long long)handle->write_bytes,
             (unsigned long long)handle->write_calls,
             handle->max_write_request,
             handle->max_backend_write_request,
             smb2fs_write_buffer_size,
+            smb2fs_async_write_size,
+            handle->server_max_write_size,
             (unsigned long long)handle->write_submits,
             handle->max_write_in_flight,
             (unsigned long long)handle->write_buffer_flushes,
