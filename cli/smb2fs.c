@@ -53,7 +53,7 @@
 
 #define SMB2FS_DEFAULT_IOSIZE "8388608"
 #define SMB2FS_MAX_ASYNC_WRITES 32
-#define SMB2FS_MAX_ASYNC_WRITE_SIZE (256 * 1024)
+#define SMB2FS_MAX_ASYNC_WRITE_SIZE (1024 * 1024)
 
 static struct smb2_context *smb2_ctx = NULL;
 static struct fuse_operations smb2fs_ops;
