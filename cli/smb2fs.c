@@ -61,6 +61,10 @@ static int smb2fs_perf_log = 0;
 static int smb2fs_trace_log = 0;
 static FILE *smb2fs_perf_stream = NULL;
 
+static int smb2fs_truncate(const char *path, off_t size);
+static int smb2fs_ftruncate(const char *path, off_t size,
+                            struct fuse_file_info *fi);
+
 /* Securely zero memory without compiler elision. */
 static void secure_zero(void *ptr, size_t len)
 {
@@ -1727,6 +1731,101 @@ static int smb2fs_utimens(const char *path, const struct timespec tv[2])
     return 0;
 }
 
+#ifdef __APPLE__
+static void smb2fs_trace_setattr_x(const char *op, const char *path,
+                                   const struct setattr_x *attr, int ret)
+{
+    if (!attr) {
+        smb2fs_trace_printf("smb2fs trace: %s path=%s attr=null ret=%d\n",
+                            op, path ? path : "(null)", ret);
+        return;
+    }
+
+    smb2fs_trace_printf(
+        "smb2fs trace: %s path=%s valid=0x%x mode=0%o uid=%lu gid=%lu "
+        "size=%lld flags=0x%x ret=%d\n",
+        op, path ? path : "(null)", (unsigned int)attr->valid,
+        (unsigned int)attr->mode, (unsigned long)attr->uid,
+        (unsigned long)attr->gid, (long long)attr->size,
+        (unsigned int)attr->flags, ret);
+}
+
+static int smb2fs_setattr_x(const char *path, struct setattr_x *attr)
+{
+    int ret = 0;
+
+    if (!attr)
+        ret = -EINVAL;
+    else if (SETATTR_WANTS_SIZE(attr))
+        ret = smb2fs_truncate(path, attr->size);
+
+    smb2fs_trace_setattr_x("setattr_x", path, attr, ret);
+    return ret;
+}
+
+static int smb2fs_fsetattr_x(const char *path, struct setattr_x *attr,
+                             struct fuse_file_info *fi)
+{
+    int ret = 0;
+
+    if (!attr)
+        ret = -EINVAL;
+    else if (SETATTR_WANTS_SIZE(attr))
+        ret = smb2fs_ftruncate(path, attr->size, fi);
+
+    smb2fs_trace_setattr_x("fsetattr_x", path, attr, ret);
+    return ret;
+}
+
+static int smb2fs_chflags(const char *path, uint32_t flags)
+{
+    const char *smb_path = smb2path(path);
+
+    if (!smb_path)
+        return -EINVAL;
+
+    smb2fs_trace_printf("smb2fs trace: chflags path=%s flags=0x%x ret=0\n",
+                        path, (unsigned int)flags);
+    return 0;
+}
+
+static int smb2fs_setbkuptime(const char *path, const struct timespec *tv)
+{
+    const char *smb_path = smb2path(path);
+    (void)tv;
+
+    if (!smb_path)
+        return -EINVAL;
+
+    smb2fs_trace_printf("smb2fs trace: setbkuptime path=%s ret=0\n", path);
+    return 0;
+}
+
+static int smb2fs_setchgtime(const char *path, const struct timespec *tv)
+{
+    const char *smb_path = smb2path(path);
+    (void)tv;
+
+    if (!smb_path)
+        return -EINVAL;
+
+    smb2fs_trace_printf("smb2fs trace: setchgtime path=%s ret=0\n", path);
+    return 0;
+}
+
+static int smb2fs_setcrtime(const char *path, const struct timespec *tv)
+{
+    const char *smb_path = smb2path(path);
+    (void)tv;
+
+    if (!smb_path)
+        return -EINVAL;
+
+    smb2fs_trace_printf("smb2fs trace: setcrtime path=%s ret=0\n", path);
+    return 0;
+}
+#endif
+
 static int smb2fs_readdir(const char *path, void *buf, fuse_fill_dir_t filler,
                           off_t offset, struct fuse_file_info *fi)
 {
@@ -2179,6 +2278,14 @@ static struct fuse_operations smb2fs_ops = {
     .chmod    = smb2fs_chmod,
     .chown    = smb2fs_chown,
     .utimens  = smb2fs_utimens,
+#ifdef __APPLE__
+    .chflags  = smb2fs_chflags,
+    .setbkuptime = smb2fs_setbkuptime,
+    .setchgtime = smb2fs_setchgtime,
+    .setcrtime = smb2fs_setcrtime,
+    .setattr_x = smb2fs_setattr_x,
+    .fsetattr_x = smb2fs_fsetattr_x,
+#endif
     .open     = smb2fs_open,
     .create   = smb2fs_create,
     .read     = smb2fs_read,
