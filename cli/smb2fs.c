@@ -1044,6 +1044,26 @@ static void smb2fs_close_fi_handle(struct fuse_file_info *fi)
     fi->fh = 0;
 }
 
+static int smb2fs_recreate_empty_file(const char *smb_path)
+{
+    struct smb2fh *fh;
+    int ret;
+
+    if (!smb_path)
+        return -EINVAL;
+
+    ret = smb2_unlink(smb2_ctx, smb_path);
+    if (ret < 0)
+        return ret;
+
+    fh = smb2_open(smb2_ctx, smb_path, O_CREAT | O_WRONLY | O_EXCL);
+    if (!fh)
+        return smb2fs_errno();
+
+    ret = smb2_close(smb2_ctx, fh);
+    return smb2fs_result(ret);
+}
+
 static const char *smb2fs_share_type_name(uint32_t type)
 {
     switch (type & 0x00000003) {
@@ -1714,7 +1734,7 @@ static int smb2fs_open(const char *path, struct fuse_file_info *fi)
         }
 
         if ((ret == -EACCES) || (ret == -EPERM)) {
-            ret = smb2_unlink(smb2_ctx, smb_path);
+            ret = smb2fs_recreate_empty_file(smb_path);
             if (ret < 0)
                 return ret;
             ret = smb2fs_open_handle(smb_path, fi, flags | O_CREAT);
@@ -1975,10 +1995,16 @@ static int smb2fs_release(const char *path, struct fuse_file_info *fi)
 static int smb2fs_truncate(const char *path, off_t size)
 {
     const char *smb_path = smb2path(path);
+    int ret;
+
     if (!smb_path || size < 0)
         return -EINVAL;
 
-    return smb2fs_result(smb2_truncate(smb2_ctx, smb_path, (uint64_t)size));
+    ret = smb2fs_result(smb2_truncate(smb2_ctx, smb_path, (uint64_t)size));
+    if (ret == 0 || size != 0 || (ret != -EACCES && ret != -EPERM))
+        return ret;
+
+    return smb2fs_recreate_empty_file(smb_path);
 }
 
 static int smb2fs_ftruncate(const char *path, off_t size,
