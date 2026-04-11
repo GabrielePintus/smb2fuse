@@ -2268,13 +2268,19 @@ static int smb2fs_write(const char *path, const char *buf, size_t size,
 static int smb2fs_flush(const char *path, struct fuse_file_info *fi)
 {
     struct smb2fs_handle *handle;
-    (void)path;
 
     handle = smb2fs_handle_from_fi(fi);
-    if (!handle)
-        return 0;
+    smb2fs_trace_printf(
+        "smb2fs trace: flush path=%s buffered=%zu deferred=1\n",
+        handle && handle->path ? handle->path : (path ? path : "(null)"),
+        handle ? handle->write_buffer_len : 0);
 
-    return smb2fs_flush_write_buffer(handle);
+    /*
+     * FUSE flush is a close notification, not fsync, and macOS may call it far
+     * more often than the final close. Flushing here destroys the 8 MiB write
+     * coalescing that Terminal cp needs, so defer to fsync/release/truncate/stat.
+     */
+    return 0;
 }
 
 static int smb2fs_fsync(const char *path, int datasync,
