@@ -31,6 +31,7 @@
 #include <fuse/fuse.h>
 #include <fuse/fuse_opt.h>
 #include <stdio.h>
+#include <stdarg.h>
 #include <stdlib.h>
 #include <string.h>
 #include <ctype.h>
@@ -56,6 +57,8 @@
 
 static struct smb2_context *smb2_ctx = NULL;
 static struct fuse_operations smb2fs_ops;
+static int smb2fs_perf_log = 0;
+static FILE *smb2fs_perf_stream = NULL;
 
 /* Securely zero memory without compiler elision. */
 static void secure_zero(void *ptr, size_t len)
@@ -87,6 +90,55 @@ static int smb2fs_result(int rc)
     return (rc < 0) ? rc : 0;
 }
 
+static int smb2fs_perf_init(void)
+{
+    const char *perf = getenv("SMB2FS_PERF");
+
+    smb2fs_perf_log = 0;
+    smb2fs_perf_stream = NULL;
+
+    if (!perf || *perf == '\0' || strcmp(perf, "0") == 0)
+        return 0;
+
+    smb2fs_perf_log = 1;
+    if (strcmp(perf, "1") == 0) {
+        smb2fs_perf_stream = stderr;
+        return 0;
+    }
+
+    smb2fs_perf_stream = fopen(perf, "a");
+    if (!smb2fs_perf_stream) {
+        fprintf(stderr, "Warning: could not open SMB2FS_PERF log '%s': %s\n",
+                perf, strerror(errno));
+        smb2fs_perf_stream = stderr;
+        return -1;
+    }
+
+    setvbuf(smb2fs_perf_stream, NULL, _IOLBF, 0);
+    return 0;
+}
+
+static void smb2fs_perf_close(void)
+{
+    if (smb2fs_perf_stream && smb2fs_perf_stream != stderr)
+        fclose(smb2fs_perf_stream);
+    smb2fs_perf_stream = NULL;
+    smb2fs_perf_log = 0;
+}
+
+static void smb2fs_perf_printf(const char *fmt, ...)
+{
+    va_list ap;
+
+    if (!smb2fs_perf_log || !smb2fs_perf_stream)
+        return;
+
+    va_start(ap, fmt);
+    vfprintf(smb2fs_perf_stream, fmt, ap);
+    va_end(ap);
+    fflush(smb2fs_perf_stream);
+}
+
 struct smb2fs_config {
     char *server;
     char *share;
@@ -111,8 +163,6 @@ struct smb2fs_handle {
     size_t max_write_request;
     int max_write_in_flight;
 };
-
-static int smb2fs_perf_log = 0;
 
 static void smb2fs_secure_free(char **ptr, size_t len)
 {
@@ -1246,7 +1296,7 @@ static int smb2fs_prepare_password(int *password_from_argv_out,
 
 static int smb2fs_create_context(void)
 {
-    smb2fs_perf_log = (getenv("SMB2FS_PERF") != NULL);
+    smb2fs_perf_init();
 
     smb2_ctx = smb2_init_context();
     if (!smb2_ctx) {
@@ -1861,15 +1911,15 @@ static int smb2fs_release(const char *path, struct fuse_file_info *fi)
         return -EBADF;
 
     if (smb2fs_perf_log && handle->write_calls > 0) {
-        fprintf(stderr,
-                "smb2fs perf: %s write_bytes=%llu write_calls=%llu "
-                "max_fuse_write=%zu smb_submits=%llu max_in_flight=%d\n",
-                handle->path ? handle->path : path,
-                (unsigned long long)handle->write_bytes,
-                (unsigned long long)handle->write_calls,
-                handle->max_write_request,
-                (unsigned long long)handle->write_submits,
-                handle->max_write_in_flight);
+        smb2fs_perf_printf(
+            "smb2fs perf: %s write_bytes=%llu write_calls=%llu "
+            "max_fuse_write=%zu smb_submits=%llu max_in_flight=%d\n",
+            handle->path ? handle->path : path,
+            (unsigned long long)handle->write_bytes,
+            (unsigned long long)handle->write_calls,
+            handle->max_write_request,
+            (unsigned long long)handle->write_submits,
+            handle->max_write_in_flight);
     }
 
     ret = smb2_close(smb2_ctx, handle->fh);
@@ -2049,5 +2099,6 @@ out:
     smb2fs_cleanup_auto_mountpoint(&auto_mountpoint, &auto_mountpoint_created,
                                    &auto_mount_parent, &auto_mount_parent_created);
     smb2fs_free_config();
+    smb2fs_perf_close();
     return ret;
 }
