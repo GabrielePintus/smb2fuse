@@ -269,6 +269,7 @@ The GUI does not replace `smb2fs`; it simply launches the existing executable wi
 
 - **Single-threaded:** libsmb2 is not thread-safe. `smb2fs` passes `-s` to FUSE to enforce single-threaded operation.
 - **Static permissions:** All directories are hardcoded to `0755` and files to `0644`, owned by the user who ran the mount. Actual SMB permissions are not reflected.
+- **Finder metadata:** `smb2fs` enables macFUSE `auto_xattr`, so Finder can store extended attributes and resource forks as AppleDouble `._*` files on shares that do not expose native macOS metadata streams.
 - **No SMB1:** Only SMB2 and above are supported.
 - **Limited testing:** Only tested on macOS 10.7 Lion with FUSE for macOS 3.11.2 and libsmb2 built from source.
 

@@ -1100,7 +1100,7 @@ static int smb2fs_prepare_mount_args(struct fuse_args *src, struct fuse_args *ds
     /* -s = single-threaded (libsmb2 is not thread-safe) */
     if (fuse_opt_add_arg(dst, "-s") < 0 ||
         fuse_opt_add_arg(dst, "-o") < 0 ||
-        fuse_opt_add_arg(dst, "defer_permissions") < 0) {
+        fuse_opt_add_arg(dst, "defer_permissions,auto_xattr") < 0) {
         return -1;
     }
 
@@ -1349,11 +1349,40 @@ static const char *smb2path(const char *fuse_path)
     return fuse_path + 1;
 }
 
-static uint32_t smb2fs_io_size(size_t size)
+static uint32_t smb2fs_io_size(size_t size, uint32_t server_limit)
+{
+    size_t limit = server_limit ? (size_t)server_limit : (64 * 1024);
+
+    if (limit > (size_t)INT_MAX)
+        limit = (size_t)INT_MAX;
+    if (size < limit)
+        limit = size;
+
+    if (limit == 0)
+        return 0;
+    return (uint32_t)limit;
+}
+
+static int smb2fs_io_offset(off_t base, size_t delta, uint64_t *out)
+{
+    uint64_t ubase;
+
+    if (base < 0 || !out)
+        return -EINVAL;
+
+    ubase = (uint64_t)base;
+    if (ubase > UINT64_MAX - (uint64_t)delta)
+        return -EOVERFLOW;
+
+    *out = ubase + (uint64_t)delta;
+    return 0;
+}
+
+static int smb2fs_transfer_fits_fuse_result(size_t size)
 {
     if (size > (size_t)INT_MAX)
-        return (uint32_t)INT_MAX;
-    return (uint32_t)size;
+        return -EIO;
+    return 0;
 }
 
 static int smb2fs_getattr(const char *path, struct stat *stbuf)
@@ -1376,6 +1405,25 @@ static int smb2fs_getattr(const char *path, struct stat *stbuf)
 
     struct smb2_stat_64 st;
     rc = smb2_stat(smb2_ctx, smb_path, &st);
+    if (rc < 0)
+        return rc;
+
+    smb2stat_to_stat(&st, stbuf);
+    return 0;
+}
+
+static int smb2fs_fgetattr(const char *path, struct stat *stbuf,
+                           struct fuse_file_info *fi)
+{
+    struct smb2fs_handle *handle;
+    struct smb2_stat_64 st;
+    int rc;
+
+    handle = smb2fs_handle_from_fi(fi);
+    if (!handle)
+        return smb2fs_getattr(path, stbuf);
+
+    rc = smb2_fstat(smb2_ctx, handle->fh, &st);
     if (rc < 0)
         return rc;
 
@@ -1447,63 +1495,125 @@ static int smb2fs_create(const char *path, mode_t mode, struct fuse_file_info *f
 static int smb2fs_read(const char *path, char *buf, size_t size, off_t offset,
                        struct fuse_file_info *fi)
 {
-    uint32_t io_size;
+    size_t done = 0;
+    uint32_t max_read_size;
     struct smb2fs_handle *handle;
-    int ret;
     (void)path;
     if (offset < 0)
         return -EINVAL;
     if (size == 0)
         return 0;
+    if (smb2fs_transfer_fits_fuse_result(size) < 0)
+        return -EIO;
+
     handle = smb2fs_handle_from_fi(fi);
     if (!handle)
         return -EBADF;
 
-    io_size = smb2fs_io_size(size);
+    max_read_size = smb2_get_max_read_size(smb2_ctx);
 
-    ret = smb2_lseek(smb2_ctx, handle->fh, offset, SEEK_SET, NULL);
-    if (ret < 0)
-        return ret;
+    while (done < size) {
+        uint32_t io_size = smb2fs_io_size(size - done, max_read_size);
+        uint64_t read_offset;
+        int ret;
 
-    ret = smb2_read(smb2_ctx, handle->fh, (uint8_t *)buf, io_size);
-    return (ret < 0) ? ret : ret;
+        if (io_size == 0)
+            break;
+
+        ret = smb2fs_io_offset(offset, done, &read_offset);
+        if (ret < 0)
+            return ret;
+
+        ret = smb2_pread(smb2_ctx, handle->fh, (uint8_t *)buf + done,
+                         io_size, read_offset);
+        if (ret < 0)
+            return ret;
+        if (ret == 0)
+            break;
+
+        done += (size_t)ret;
+    }
+
+    return (int)done;
 }
 
 static int smb2fs_write(const char *path, const char *buf, size_t size,
                         off_t offset, struct fuse_file_info *fi)
 {
-    uint32_t io_size;
+    size_t done = 0;
+    uint32_t max_write_size;
     struct smb2fs_handle *handle;
     struct smb2_stat_64 st;
-    off_t write_offset;
-    int ret;
+    uint64_t write_offset;
     (void)path;
     if (size == 0)
         return 0;
+    if (smb2fs_transfer_fits_fuse_result(size) < 0)
+        return -EIO;
+
     handle = smb2fs_handle_from_fi(fi);
     if (!handle)
         return -EBADF;
 
-    io_size = smb2fs_io_size(size);
-
     if (handle->open_flags & O_APPEND) {
         /* Enforce append in user space so writes do not depend on FUSE/kernel quirks. */
+        int ret;
+
         ret = smb2_stat(smb2_ctx, handle->path, &st);
         if (ret < 0)
             return ret;
-        write_offset = (off_t)st.smb2_size;
+        write_offset = (uint64_t)st.smb2_size;
     } else {
         if (offset < 0)
             return -EINVAL;
-        write_offset = offset;
+        write_offset = (uint64_t)offset;
     }
 
-    ret = smb2_lseek(smb2_ctx, handle->fh, write_offset, SEEK_SET, NULL);
-    if (ret < 0)
-        return ret;
+    max_write_size = smb2_get_max_write_size(smb2_ctx);
 
-    ret = smb2_write(smb2_ctx, handle->fh, (const uint8_t *)buf, io_size);
-    return (ret < 0) ? ret : ret;
+    while (done < size) {
+        uint32_t io_size = smb2fs_io_size(size - done, max_write_size);
+        int ret;
+
+        if (io_size == 0)
+            break;
+        if (write_offset > UINT64_MAX - (uint64_t)done)
+            return -EOVERFLOW;
+
+        ret = smb2_pwrite(smb2_ctx, handle->fh,
+                          (const uint8_t *)buf + done, io_size,
+                          write_offset + (uint64_t)done);
+        if (ret < 0)
+            return ret;
+        if (ret == 0)
+            return done > 0 ? (int)done : -EIO;
+
+        done += (size_t)ret;
+    }
+
+    return (int)done;
+}
+
+static int smb2fs_flush(const char *path, struct fuse_file_info *fi)
+{
+    (void)path;
+    (void)fi;
+
+    return 0;
+}
+
+static int smb2fs_fsync(const char *path, int datasync,
+                        struct fuse_file_info *fi)
+{
+    struct smb2fs_handle *handle;
+    (void)path;
+    (void)datasync;
+
+    handle = smb2fs_handle_from_fi(fi);
+    if (!handle)
+        return -EBADF;
+
+    return smb2fs_result(smb2_fsync(smb2_ctx, handle->fh));
 }
 
 static int smb2fs_release(const char *path, struct fuse_file_info *fi)
@@ -1530,6 +1640,21 @@ static int smb2fs_truncate(const char *path, off_t size)
         return -EINVAL;
 
     return smb2fs_result(smb2_truncate(smb2_ctx, smb_path, (uint64_t)size));
+}
+
+static int smb2fs_ftruncate(const char *path, off_t size,
+                            struct fuse_file_info *fi)
+{
+    struct smb2fs_handle *handle;
+
+    if (size < 0)
+        return -EINVAL;
+
+    handle = smb2fs_handle_from_fi(fi);
+    if (!handle)
+        return smb2fs_truncate(path, size);
+
+    return smb2fs_result(smb2_ftruncate(smb2_ctx, handle->fh, (uint64_t)size));
 }
 
 static int smb2fs_unlink(const char *path)
@@ -1595,8 +1720,12 @@ static struct fuse_operations smb2fs_ops = {
     .create   = smb2fs_create,
     .read     = smb2fs_read,
     .write    = smb2fs_write,
+    .flush    = smb2fs_flush,
+    .fsync    = smb2fs_fsync,
     .release  = smb2fs_release,
     .truncate = smb2fs_truncate,
+    .ftruncate = smb2fs_ftruncate,
+    .fgetattr  = smb2fs_fgetattr,
     .unlink   = smb2fs_unlink,
     .mkdir    = smb2fs_mkdir,
     .rmdir    = smb2fs_rmdir,
