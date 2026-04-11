@@ -1031,6 +1031,19 @@ static int smb2fs_open_handle(const char *smb_path,
     return smb2fs_set_handle(fi, smb_path, fh, fi->flags);
 }
 
+static void smb2fs_close_fi_handle(struct fuse_file_info *fi)
+{
+    struct smb2fs_handle *handle = smb2fs_handle_from_fi(fi);
+
+    if (!handle)
+        return;
+
+    smb2_close(smb2_ctx, handle->fh);
+    free(handle->path);
+    free(handle);
+    fi->fh = 0;
+}
+
 static const char *smb2fs_share_type_name(uint32_t type)
 {
     switch (type & 0x00000003) {
@@ -1684,22 +1697,27 @@ static int smb2fs_open(const char *path, struct fuse_file_info *fi)
     if (ret < 0 && (flags & O_TRUNC) &&
         ((ret == -EACCES) || (ret == -EPERM))) {
         struct smb2fs_handle *handle;
+        int trunc_ret;
 
         ret = smb2fs_open_handle(smb_path, fi, flags & ~O_TRUNC);
-        if (ret < 0)
-            return ret;
+        if (ret == 0) {
+            handle = smb2fs_handle_from_fi(fi);
+            if (!handle)
+                return -EBADF;
 
-        handle = smb2fs_handle_from_fi(fi);
-        if (!handle)
-            return -EBADF;
+            trunc_ret = smb2_ftruncate(smb2_ctx, handle->fh, 0);
+            if (trunc_ret == 0)
+                return 0;
 
-        ret = smb2_ftruncate(smb2_ctx, handle->fh, 0);
-        if (ret < 0) {
-            smb2_close(smb2_ctx, handle->fh);
-            free(handle->path);
-            free(handle);
-            fi->fh = 0;
-            return ret;
+            smb2fs_close_fi_handle(fi);
+            ret = trunc_ret;
+        }
+
+        if ((ret == -EACCES) || (ret == -EPERM)) {
+            ret = smb2_unlink(smb2_ctx, smb_path);
+            if (ret < 0)
+                return ret;
+            ret = smb2fs_open_handle(smb_path, fi, flags | O_CREAT);
         }
     }
 
