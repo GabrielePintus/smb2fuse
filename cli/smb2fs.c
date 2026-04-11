@@ -1394,6 +1394,24 @@ static int smb2fs_transfer_fits_fuse_result(size_t size)
     return 0;
 }
 
+static void *smb2fs_init(struct fuse_conn_info *conn)
+{
+    if (!conn)
+        return NULL;
+
+    if (conn->capable & FUSE_CAP_BIG_WRITES)
+        conn->want |= FUSE_CAP_BIG_WRITES;
+    if (conn->capable & FUSE_CAP_ASYNC_READ)
+        conn->want |= FUSE_CAP_ASYNC_READ;
+
+    if (conn->max_write > 0 && conn->max_write > (8 * 1024 * 1024))
+        conn->max_write = 8 * 1024 * 1024;
+    if (conn->max_readahead > 0 && conn->max_readahead > (8 * 1024 * 1024))
+        conn->max_readahead = 8 * 1024 * 1024;
+
+    return NULL;
+}
+
 struct smb2fs_async_write_state {
     int in_flight;
     int error;
@@ -1914,6 +1932,7 @@ static int smb2fs_statfs(const char *path, struct statvfs *stv)
 }
 
 static struct fuse_operations smb2fs_ops = {
+    .init     = smb2fs_init,
     .getattr  = smb2fs_getattr,
     .readdir  = smb2fs_readdir,
     .chmod    = smb2fs_chmod,
