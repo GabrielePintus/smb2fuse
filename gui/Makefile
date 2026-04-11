@@ -23,7 +23,7 @@ SOURCES := main.m \
 	SMBKeychainStore.m
 OBJECTS := $(patsubst %.m,$(BUILD_DIR)/%.o,$(SOURCES))
 
-.PHONY: all clean
+.PHONY: all clean copy-cli
 
 all: $(APP_BUNDLE)
 
@@ -51,10 +51,13 @@ $(ICON_FILE): $(ICON_SOURCE) | $(BUILD_DIR)
 	cp $(ICON_SOURCE) $(ICONSET_DIR)/icon_512x512@2x.png
 	iconutil -c icns $(ICONSET_DIR) -o $(ICON_FILE)
 
-$(APP_BUNDLE): $(APP_EXECUTABLE) $(ICON_FILE) Info.plist
+copy-cli: | $(BUILD_DIR)
+	mkdir -p $(RESOURCES_DIR)
+	if [ -f $(CLI_BINARY) ]; then cp $(CLI_BINARY) $(RESOURCES_DIR)/smb2fs; else echo "warning: $(CLI_BINARY) not found; build the CLI first"; fi
+
+$(APP_BUNDLE): $(APP_EXECUTABLE) $(ICON_FILE) Info.plist copy-cli
 	cp Info.plist $(CONTENTS_DIR)/Info.plist
 	printf 'APPL????' > $(CONTENTS_DIR)/PkgInfo
-	if [ -f $(CLI_BINARY) ]; then cp $(CLI_BINARY) $(RESOURCES_DIR)/smb2fs; else echo "warning: $(CLI_BINARY) not found; build the CLI first"; fi
 
 clean:
 	rm -rf $(BUILD_DIR)

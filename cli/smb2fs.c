@@ -45,6 +45,10 @@
 #include <smb2/libsmb2-raw.h>
 #include <smb2/smb2-errors.h>
 
+#ifndef ENOTSUP
+#define ENOTSUP EOPNOTSUPP
+#endif
+
 static struct smb2_context *smb2_ctx = NULL;
 static struct fuse_operations smb2fs_ops;
 
@@ -1431,6 +1435,40 @@ static int smb2fs_fgetattr(const char *path, struct stat *stbuf,
     return 0;
 }
 
+static int smb2fs_chmod(const char *path, mode_t mode)
+{
+    const char *smb_path = smb2path(path);
+    (void)mode;
+
+    if (!smb_path)
+        return -EINVAL;
+
+    return 0;
+}
+
+static int smb2fs_chown(const char *path, uid_t uid, gid_t gid)
+{
+    const char *smb_path = smb2path(path);
+    (void)uid;
+    (void)gid;
+
+    if (!smb_path)
+        return -EINVAL;
+
+    return 0;
+}
+
+static int smb2fs_utimens(const char *path, const struct timespec tv[2])
+{
+    const char *smb_path = smb2path(path);
+    (void)tv;
+
+    if (!smb_path)
+        return -EINVAL;
+
+    return 0;
+}
+
 static int smb2fs_readdir(const char *path, void *buf, fuse_fill_dir_t filler,
                           off_t offset, struct fuse_file_info *fi)
 {
@@ -1616,6 +1654,46 @@ static int smb2fs_fsync(const char *path, int datasync,
     return smb2fs_result(smb2_fsync(smb2_ctx, handle->fh));
 }
 
+static int smb2fs_setxattr(const char *path, const char *name,
+                           const char *value, size_t size, int flags)
+{
+    (void)path;
+    (void)name;
+    (void)value;
+    (void)size;
+    (void)flags;
+
+    return -ENOTSUP;
+}
+
+static int smb2fs_getxattr(const char *path, const char *name,
+                           char *value, size_t size)
+{
+    (void)path;
+    (void)name;
+    (void)value;
+    (void)size;
+
+    return -ENOTSUP;
+}
+
+static int smb2fs_listxattr(const char *path, char *list, size_t size)
+{
+    (void)path;
+    (void)list;
+    (void)size;
+
+    return -ENOTSUP;
+}
+
+static int smb2fs_removexattr(const char *path, const char *name)
+{
+    (void)path;
+    (void)name;
+
+    return -ENOTSUP;
+}
+
 static int smb2fs_release(const char *path, struct fuse_file_info *fi)
 {
     struct smb2fs_handle *handle;
@@ -1716,12 +1794,19 @@ static int smb2fs_statfs(const char *path, struct statvfs *stv)
 static struct fuse_operations smb2fs_ops = {
     .getattr  = smb2fs_getattr,
     .readdir  = smb2fs_readdir,
+    .chmod    = smb2fs_chmod,
+    .chown    = smb2fs_chown,
+    .utimens  = smb2fs_utimens,
     .open     = smb2fs_open,
     .create   = smb2fs_create,
     .read     = smb2fs_read,
     .write    = smb2fs_write,
     .flush    = smb2fs_flush,
     .fsync    = smb2fs_fsync,
+    .setxattr = smb2fs_setxattr,
+    .getxattr = smb2fs_getxattr,
+    .listxattr = smb2fs_listxattr,
+    .removexattr = smb2fs_removexattr,
     .release  = smb2fs_release,
     .truncate = smb2fs_truncate,
     .ftruncate = smb2fs_ftruncate,
