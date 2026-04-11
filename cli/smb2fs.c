@@ -1654,15 +1654,34 @@ static int smb2fs_fgetattr(const char *path, struct stat *stbuf,
 {
     struct smb2fs_handle *handle;
     struct smb2_stat_64 st;
+    const char *smb_path;
     int rc;
+    int fallback_rc = 0;
 
     handle = smb2fs_handle_from_fi(fi);
     if (!handle)
         return smb2fs_getattr(path, stbuf);
 
     rc = smb2_fstat(smb2_ctx, handle->fh, &st);
-    if (rc < 0)
-        return rc;
+    if (rc < 0) {
+        smb_path = handle->path ? handle->path : smb2path(path);
+        if (!smb_path) {
+            smb2fs_trace_printf(
+                "smb2fs trace: fgetattr path=%s fstat_ret=%d fallback_stat_ret=%d\n",
+                path ? path : "(null)", rc, -EINVAL);
+            return -EINVAL;
+        }
+
+        fallback_rc = smb2_stat(smb2_ctx, smb_path, &st);
+        smb2fs_trace_printf(
+            "smb2fs trace: fgetattr path=%s fstat_ret=%d fallback_stat_ret=%d\n",
+            path ? path : "(null)", rc, fallback_rc);
+        if (fallback_rc < 0)
+            return fallback_rc;
+    } else {
+        smb2fs_trace_printf("smb2fs trace: fgetattr path=%s fstat_ret=0\n",
+                            path ? path : "(null)");
+    }
 
     smb2stat_to_stat(&st, stbuf);
     return 0;
