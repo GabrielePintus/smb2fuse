@@ -40,6 +40,7 @@
 #include <fcntl.h>
 #include <poll.h>
 #include <sys/stat.h>
+#include <sys/time.h>
 #include <unistd.h>
 
 #include <smb2/smb2.h>
@@ -55,7 +56,9 @@
 #define SMB2FS_DEFAULT_IOSIZE "8388608"
 #define SMB2FS_MAX_ASYNC_WRITES 32
 #define SMB2FS_MAX_ASYNC_WRITE_SIZE (1024 * 1024)
-#define SMB2FS_WRITE_BUFFER_SIZE SMB2FS_DEFAULT_IOSIZE_BYTES
+#define SMB2FS_DEFAULT_WRITE_BUFFER_SIZE \
+    (SMB2FS_MAX_ASYNC_WRITES * SMB2FS_MAX_ASYNC_WRITE_SIZE)
+#define SMB2FS_MAX_WRITE_BUFFER_SIZE (128 * 1024 * 1024)
 #ifdef O_DSYNC
 #define SMB2FS_O_DSYNC O_DSYNC
 #else
@@ -68,11 +71,13 @@ static struct fuse_operations smb2fs_ops;
 static int smb2fs_perf_log = 0;
 static int smb2fs_trace_log = 0;
 static int smb2fs_write_buffering_enabled = 1;
+static size_t smb2fs_write_buffer_size = SMB2FS_DEFAULT_WRITE_BUFFER_SIZE;
 static FILE *smb2fs_perf_stream = NULL;
 
 static int smb2fs_truncate(const char *path, off_t size);
 static int smb2fs_ftruncate(const char *path, off_t size,
                             struct fuse_file_info *fi);
+static int smb2fs_parse_size(const char *value, size_t *out);
 
 /* Securely zero memory without compiler elision. */
 static void secure_zero(void *ptr, size_t len)
@@ -104,16 +109,29 @@ static int smb2fs_result(int rc)
     return (rc < 0) ? rc : 0;
 }
 
+static uint64_t smb2fs_now_us(void)
+{
+    struct timeval tv;
+
+    if (gettimeofday(&tv, NULL) < 0)
+        return 0;
+
+    return (uint64_t)tv.tv_sec * 1000000ULL + (uint64_t)tv.tv_usec;
+}
+
 static int smb2fs_perf_init(void)
 {
     const char *perf = getenv("SMB2FS_PERF");
     const char *trace = getenv("SMB2FS_TRACE");
     const char *write_buffer = getenv("SMB2FS_WRITE_BUFFER");
+    const char *write_buffer_size = getenv("SMB2FS_WRITE_BUFFER_SIZE");
     const char *log_path = NULL;
+    size_t parsed_write_buffer_size;
 
     smb2fs_perf_log = 0;
     smb2fs_trace_log = 0;
     smb2fs_write_buffering_enabled = 1;
+    smb2fs_write_buffer_size = SMB2FS_DEFAULT_WRITE_BUFFER_SIZE;
     smb2fs_perf_stream = NULL;
 
     if (trace && *trace != '\0' && strcmp(trace, "0") != 0)
@@ -124,6 +142,13 @@ static int smb2fs_perf_init(void)
 
     if (write_buffer && strcmp(write_buffer, "0") == 0) {
         smb2fs_write_buffering_enabled = 0;
+    }
+
+    if (write_buffer_size &&
+        smb2fs_parse_size(write_buffer_size, &parsed_write_buffer_size) == 0 &&
+        parsed_write_buffer_size >= SMB2FS_MAX_ASYNC_WRITE_SIZE &&
+        parsed_write_buffer_size <= SMB2FS_MAX_WRITE_BUFFER_SIZE) {
+        smb2fs_write_buffer_size = parsed_write_buffer_size;
     }
 
     if (!smb2fs_perf_log && !smb2fs_trace_log)
@@ -213,6 +238,8 @@ struct smb2fs_handle {
     uint64_t write_calls;
     uint64_t write_submits;
     uint64_t write_buffer_flushes;
+    uint64_t backend_write_us;
+    uint64_t max_backend_write_us;
     size_t max_write_request;
     size_t max_backend_write_request;
     int max_write_in_flight;
@@ -285,6 +312,23 @@ static int smb2fs_parse_int(const char *value, int *out)
     }
 
     *out = (int)parsed;
+    return 0;
+}
+
+static int smb2fs_parse_size(const char *value, size_t *out)
+{
+    char *end;
+    unsigned long long parsed;
+
+    if (!value || !out)
+        return -1;
+
+    errno = 0;
+    parsed = strtoull(value, &end, 10);
+    if (errno != 0 || !end || *end != '\0' || parsed > (unsigned long long)SIZE_MAX)
+        return -1;
+
+    *out = (size_t)parsed;
     return 0;
 }
 
@@ -1658,6 +1702,9 @@ static int smb2fs_write_direct(struct smb2fs_handle *handle,
     size_t done = 0;
     uint32_t max_write_size;
     struct smb2fs_async_write_state state;
+    uint64_t start_us;
+    uint64_t end_us;
+    uint64_t elapsed_us;
     int ret = 0;
 
     if (!handle || !buf)
@@ -1669,6 +1716,7 @@ static int smb2fs_write_direct(struct smb2fs_handle *handle,
 
     max_write_size = smb2_get_max_write_size(smb2_ctx);
     memset(&state, 0, sizeof(state));
+    start_us = smb2fs_now_us();
     if (size > handle->max_backend_write_request)
         handle->max_backend_write_request = size;
 
@@ -1717,6 +1765,12 @@ static int smb2fs_write_direct(struct smb2fs_handle *handle,
             ret = drain_ret;
     }
 
+    end_us = smb2fs_now_us();
+    elapsed_us = (end_us >= start_us) ? (end_us - start_us) : 0;
+    handle->backend_write_us += elapsed_us;
+    if (elapsed_us > handle->max_backend_write_us)
+        handle->max_backend_write_us = elapsed_us;
+
     return ret;
 }
 
@@ -1758,7 +1812,7 @@ static int smb2fs_buffered_write(struct smb2fs_handle *handle,
         return 0;
     /*
      * Terminal cp often feeds us 1 MiB writes even when Finder proves the mount
-     * can push 8 MiB batches. Coalesce sequential writes unless the caller asked
+     * can push larger batches. Coalesce sequential writes unless the caller asked
      * for synchronous write semantics.
      */
     if (!smb2fs_write_buffering_enabled ||
@@ -1773,7 +1827,7 @@ static int smb2fs_buffered_write(struct smb2fs_handle *handle,
             return ret;
     }
 
-    if (size >= SMB2FS_WRITE_BUFFER_SIZE) {
+    if (size >= smb2fs_write_buffer_size) {
         ret = smb2fs_flush_write_buffer(handle);
         if (ret < 0)
             return ret;
@@ -1781,10 +1835,10 @@ static int smb2fs_buffered_write(struct smb2fs_handle *handle,
     }
 
     if (!handle->write_buffer) {
-        handle->write_buffer = malloc(SMB2FS_WRITE_BUFFER_SIZE);
+        handle->write_buffer = malloc(smb2fs_write_buffer_size);
         if (!handle->write_buffer)
             return smb2fs_write_direct(handle, buf, size, write_offset);
-        handle->write_buffer_cap = SMB2FS_WRITE_BUFFER_SIZE;
+        handle->write_buffer_cap = smb2fs_write_buffer_size;
     }
 
     if (handle->write_buffer_active &&
@@ -2360,16 +2414,20 @@ static int smb2fs_release(const char *path, struct fuse_file_info *fi)
     if (smb2fs_perf_log && handle->write_calls > 0) {
         smb2fs_perf_printf(
             "smb2fs perf: %s write_bytes=%llu write_calls=%llu "
-            "max_fuse_write=%zu max_backend_write=%zu smb_submits=%llu "
-            "max_in_flight=%d buffered_flushes=%llu\n",
+            "max_fuse_write=%zu max_backend_write=%zu write_buffer_size=%zu "
+            "smb_submits=%llu max_in_flight=%d buffered_flushes=%llu "
+            "backend_write_ms=%llu max_backend_write_ms=%llu\n",
             handle->path ? handle->path : path,
             (unsigned long long)handle->write_bytes,
             (unsigned long long)handle->write_calls,
             handle->max_write_request,
             handle->max_backend_write_request,
+            smb2fs_write_buffer_size,
             (unsigned long long)handle->write_submits,
             handle->max_write_in_flight,
-            (unsigned long long)handle->write_buffer_flushes);
+            (unsigned long long)handle->write_buffer_flushes,
+            (unsigned long long)(handle->backend_write_us / 1000),
+            (unsigned long long)(handle->max_backend_write_us / 1000));
     }
 
     if (ret == 0)
