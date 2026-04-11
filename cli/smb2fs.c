@@ -1655,24 +1655,27 @@ static int smb2fs_fsync(const char *path, int datasync,
 }
 
 static int smb2fs_setxattr(const char *path, const char *name,
-                           const char *value, size_t size, int flags)
+                           const char *value, size_t size, int flags,
+                           uint32_t position)
 {
     (void)path;
     (void)name;
     (void)value;
     (void)size;
     (void)flags;
+    (void)position;
 
     return -ENOTSUP;
 }
 
 static int smb2fs_getxattr(const char *path, const char *name,
-                           char *value, size_t size)
+                           char *value, size_t size, uint32_t position)
 {
     (void)path;
     (void)name;
     (void)value;
     (void)size;
+    (void)position;
 
     return -ENOTSUP;
 }
