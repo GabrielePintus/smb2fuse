@@ -49,6 +49,8 @@
 #define ENOTSUP EOPNOTSUPP
 #endif
 
+#define SMB2FS_DEFAULT_IOSIZE "1048576"
+
 static struct smb2_context *smb2_ctx = NULL;
 static struct fuse_operations smb2fs_ops;
 
@@ -1104,7 +1106,7 @@ static int smb2fs_prepare_mount_args(struct fuse_args *src, struct fuse_args *ds
     /* -s = single-threaded (libsmb2 is not thread-safe) */
     if (fuse_opt_add_arg(dst, "-s") < 0 ||
         fuse_opt_add_arg(dst, "-o") < 0 ||
-        fuse_opt_add_arg(dst, "defer_permissions,auto_xattr") < 0) {
+        fuse_opt_add_arg(dst, "defer_permissions,auto_xattr,iosize=" SMB2FS_DEFAULT_IOSIZE) < 0) {
         return -1;
     }
 
