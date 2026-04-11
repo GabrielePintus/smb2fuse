@@ -1673,12 +1673,37 @@ static int smb2fs_open(const char *path, struct fuse_file_info *fi)
 {
     const char *smb_path = smb2path(path);
     int flags;
+    int ret;
 
     if (!smb_path)
         return -EINVAL;
 
     flags = smb2fs_supported_open_flags(fi->flags, O_RDONLY, 0);
-    return smb2fs_open_handle(smb_path, fi, flags);
+    ret = smb2fs_open_handle(smb_path, fi, flags);
+
+    if (ret < 0 && (flags & O_TRUNC) &&
+        ((ret == -EACCES) || (ret == -EPERM))) {
+        struct smb2fs_handle *handle;
+
+        ret = smb2fs_open_handle(smb_path, fi, flags & ~O_TRUNC);
+        if (ret < 0)
+            return ret;
+
+        handle = smb2fs_handle_from_fi(fi);
+        if (!handle)
+            return -EBADF;
+
+        ret = smb2_ftruncate(smb2_ctx, handle->fh, 0);
+        if (ret < 0) {
+            smb2_close(smb2_ctx, handle->fh);
+            free(handle->path);
+            free(handle);
+            fi->fh = 0;
+            return ret;
+        }
+    }
+
+    return ret;
 }
 
 static int smb2fs_create(const char *path, mode_t mode, struct fuse_file_info *fi)
