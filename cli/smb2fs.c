@@ -1733,7 +1733,7 @@ static int smb2fs_open(const char *path, struct fuse_file_info *fi)
             ret = trunc_ret;
         }
 
-        if ((ret == -EACCES) || (ret == -EPERM)) {
+        if (ret < 0) {
             ret = smb2fs_recreate_empty_file(smb_path);
             if (ret < 0)
                 return ret;
@@ -2001,7 +2001,7 @@ static int smb2fs_truncate(const char *path, off_t size)
         return -EINVAL;
 
     ret = smb2fs_result(smb2_truncate(smb2_ctx, smb_path, (uint64_t)size));
-    if (ret == 0 || size != 0 || (ret != -EACCES && ret != -EPERM))
+    if (ret == 0 || size != 0)
         return ret;
 
     return smb2fs_recreate_empty_file(smb_path);
