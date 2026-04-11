@@ -51,14 +51,23 @@
 #define ENOTSUP EOPNOTSUPP
 #endif
 
+#define SMB2FS_DEFAULT_IOSIZE_BYTES (8 * 1024 * 1024)
 #define SMB2FS_DEFAULT_IOSIZE "8388608"
 #define SMB2FS_MAX_ASYNC_WRITES 32
 #define SMB2FS_MAX_ASYNC_WRITE_SIZE (1024 * 1024)
+#define SMB2FS_WRITE_BUFFER_SIZE SMB2FS_DEFAULT_IOSIZE_BYTES
+#ifdef O_DSYNC
+#define SMB2FS_O_DSYNC O_DSYNC
+#else
+#define SMB2FS_O_DSYNC 0
+#endif
+#define SMB2FS_SYNC_WRITE_FLAGS (O_SYNC | SMB2FS_O_DSYNC)
 
 static struct smb2_context *smb2_ctx = NULL;
 static struct fuse_operations smb2fs_ops;
 static int smb2fs_perf_log = 0;
 static int smb2fs_trace_log = 0;
+static int smb2fs_write_buffering_enabled = 1;
 static FILE *smb2fs_perf_stream = NULL;
 
 static int smb2fs_truncate(const char *path, off_t size);
@@ -99,10 +108,12 @@ static int smb2fs_perf_init(void)
 {
     const char *perf = getenv("SMB2FS_PERF");
     const char *trace = getenv("SMB2FS_TRACE");
+    const char *write_buffer = getenv("SMB2FS_WRITE_BUFFER");
     const char *log_path = NULL;
 
     smb2fs_perf_log = 0;
     smb2fs_trace_log = 0;
+    smb2fs_write_buffering_enabled = 1;
     smb2fs_perf_stream = NULL;
 
     if (trace && *trace != '\0' && strcmp(trace, "0") != 0)
@@ -110,6 +121,10 @@ static int smb2fs_perf_init(void)
 
     if (perf && *perf != '\0' && strcmp(perf, "0") != 0)
         smb2fs_perf_log = 1;
+
+    if (write_buffer && strcmp(write_buffer, "0") == 0) {
+        smb2fs_write_buffering_enabled = 0;
+    }
 
     if (!smb2fs_perf_log && !smb2fs_trace_log)
         return 0;
@@ -189,12 +204,22 @@ struct smb2fs_handle {
     struct smb2fh *fh;
     int open_flags;
     char *path;
+    uint8_t *write_buffer;
+    size_t write_buffer_len;
+    size_t write_buffer_cap;
+    uint64_t write_buffer_offset;
+    int write_buffer_active;
     uint64_t write_bytes;
     uint64_t write_calls;
     uint64_t write_submits;
+    uint64_t write_buffer_flushes;
     size_t max_write_request;
+    size_t max_backend_write_request;
     int max_write_in_flight;
 };
+
+static struct smb2fs_handle *smb2fs_active_write_buffer_handle = NULL;
+static int smb2fs_flush_write_buffer(struct smb2fs_handle *handle);
 
 static void smb2fs_secure_free(char **ptr, size_t len)
 {
@@ -1070,7 +1095,11 @@ static void smb2fs_close_fi_handle(struct fuse_file_info *fi)
     if (!handle)
         return;
 
+    smb2fs_flush_write_buffer(handle);
     smb2_close(smb2_ctx, handle->fh);
+    if (smb2fs_active_write_buffer_handle == handle)
+        smb2fs_active_write_buffer_handle = NULL;
+    free(handle->write_buffer);
     free(handle->path);
     free(handle);
     fi->fh = 0;
@@ -1622,6 +1651,175 @@ static int smb2fs_drain_async_writes(struct smb2fs_async_write_state *state)
     return state->error;
 }
 
+static int smb2fs_write_direct(struct smb2fs_handle *handle,
+                               const uint8_t *buf, size_t size,
+                               uint64_t write_offset)
+{
+    size_t done = 0;
+    uint32_t max_write_size;
+    struct smb2fs_async_write_state state;
+    int ret = 0;
+
+    if (!handle || !buf)
+        return -EINVAL;
+    if (size == 0)
+        return 0;
+    if (smb2fs_transfer_fits_fuse_result(size) < 0)
+        return -EIO;
+
+    max_write_size = smb2_get_max_write_size(smb2_ctx);
+    memset(&state, 0, sizeof(state));
+    if (size > handle->max_backend_write_request)
+        handle->max_backend_write_request = size;
+
+    while (done < size) {
+        uint32_t io_size = smb2fs_io_size(size - done, max_write_size);
+        struct smb2fs_async_write_req *req;
+
+        ret = smb2fs_service_until_write_slot(&state, SMB2FS_MAX_ASYNC_WRITES);
+        if (ret < 0)
+            break;
+        if (io_size == 0)
+            break;
+        if (io_size > SMB2FS_MAX_ASYNC_WRITE_SIZE)
+            io_size = SMB2FS_MAX_ASYNC_WRITE_SIZE;
+        if (write_offset > UINT64_MAX - (uint64_t)done) {
+            ret = -EOVERFLOW;
+            break;
+        }
+
+        req = calloc(1, sizeof(*req));
+        if (!req) {
+            ret = -ENOMEM;
+            break;
+        }
+        req->state = &state;
+        req->expected = io_size;
+
+        ret = smb2_pwrite_async(smb2_ctx, handle->fh, buf + done, io_size,
+                                write_offset + (uint64_t)done,
+                                smb2fs_async_write_cb, req);
+        if (ret < 0) {
+            free(req);
+            break;
+        }
+
+        state.in_flight++;
+        handle->write_submits++;
+        if (state.in_flight > handle->max_write_in_flight)
+            handle->max_write_in_flight = state.in_flight;
+        done += (size_t)io_size;
+    }
+
+    if (state.in_flight > 0) {
+        int drain_ret = smb2fs_drain_async_writes(&state);
+        if (ret == 0 && drain_ret < 0)
+            ret = drain_ret;
+    }
+
+    return ret;
+}
+
+static int smb2fs_flush_write_buffer(struct smb2fs_handle *handle)
+{
+    size_t len;
+    int ret;
+
+    if (!handle || !handle->write_buffer_active || handle->write_buffer_len == 0)
+        return 0;
+
+    len = handle->write_buffer_len;
+    ret = smb2fs_write_direct(handle, handle->write_buffer, len,
+                              handle->write_buffer_offset);
+    smb2fs_trace_printf(
+        "smb2fs trace: write_flush path=%s offset=%llu size=%zu ret=%d\n",
+        handle->path ? handle->path : "(null)",
+        (unsigned long long)handle->write_buffer_offset, len, ret);
+    if (ret < 0)
+        return ret;
+
+    handle->write_buffer_len = 0;
+    handle->write_buffer_active = 0;
+    if (smb2fs_active_write_buffer_handle == handle)
+        smb2fs_active_write_buffer_handle = NULL;
+    handle->write_buffer_flushes++;
+    return 0;
+}
+
+static int smb2fs_buffered_write(struct smb2fs_handle *handle,
+                                 const uint8_t *buf, size_t size,
+                                 uint64_t write_offset)
+{
+    int ret;
+
+    if (!handle || !buf)
+        return -EINVAL;
+    if (size == 0)
+        return 0;
+    /*
+     * Terminal cp often feeds us 1 MiB writes even when Finder proves the mount
+     * can push 8 MiB batches. Coalesce sequential writes unless the caller asked
+     * for synchronous write semantics.
+     */
+    if (!smb2fs_write_buffering_enabled ||
+        (handle->open_flags & SMB2FS_SYNC_WRITE_FLAGS))
+        return smb2fs_write_direct(handle, buf, size, write_offset);
+    if (write_offset > UINT64_MAX - (uint64_t)size)
+        return -EOVERFLOW;
+    if (smb2fs_active_write_buffer_handle &&
+        smb2fs_active_write_buffer_handle != handle) {
+        ret = smb2fs_flush_write_buffer(smb2fs_active_write_buffer_handle);
+        if (ret < 0)
+            return ret;
+    }
+
+    if (size >= SMB2FS_WRITE_BUFFER_SIZE) {
+        ret = smb2fs_flush_write_buffer(handle);
+        if (ret < 0)
+            return ret;
+        return smb2fs_write_direct(handle, buf, size, write_offset);
+    }
+
+    if (!handle->write_buffer) {
+        handle->write_buffer = malloc(SMB2FS_WRITE_BUFFER_SIZE);
+        if (!handle->write_buffer)
+            return smb2fs_write_direct(handle, buf, size, write_offset);
+        handle->write_buffer_cap = SMB2FS_WRITE_BUFFER_SIZE;
+    }
+
+    if (handle->write_buffer_active &&
+        write_offset != handle->write_buffer_offset + handle->write_buffer_len) {
+        ret = smb2fs_flush_write_buffer(handle);
+        if (ret < 0)
+            return ret;
+    }
+
+    if (!handle->write_buffer_active) {
+        handle->write_buffer_offset = write_offset;
+        handle->write_buffer_len = 0;
+        handle->write_buffer_active = 1;
+        smb2fs_active_write_buffer_handle = handle;
+    }
+
+    if (size > handle->write_buffer_cap - handle->write_buffer_len) {
+        ret = smb2fs_flush_write_buffer(handle);
+        if (ret < 0)
+            return ret;
+        handle->write_buffer_offset = write_offset;
+        handle->write_buffer_len = 0;
+        handle->write_buffer_active = 1;
+        smb2fs_active_write_buffer_handle = handle;
+    }
+
+    memcpy(handle->write_buffer + handle->write_buffer_len, buf, size);
+    handle->write_buffer_len += size;
+
+    if (handle->write_buffer_len == handle->write_buffer_cap)
+        return smb2fs_flush_write_buffer(handle);
+
+    return 0;
+}
+
 static int smb2fs_getattr(const char *path, struct stat *stbuf)
 {
     const char *smb_path;
@@ -1635,6 +1833,10 @@ static int smb2fs_getattr(const char *path, struct stat *stbuf)
         stbuf->st_gid   = getgid();
         return 0;
     }
+
+    rc = smb2fs_flush_write_buffer(smb2fs_active_write_buffer_handle);
+    if (rc < 0)
+        return rc;
 
     smb_path = smb2path(path);
     if (!smb_path)
@@ -1661,6 +1863,10 @@ static int smb2fs_fgetattr(const char *path, struct stat *stbuf,
     handle = smb2fs_handle_from_fi(fi);
     if (!handle)
         return smb2fs_getattr(path, stbuf);
+
+    rc = smb2fs_flush_write_buffer(handle);
+    if (rc < 0)
+        return rc;
 
     rc = smb2_fstat(smb2_ctx, handle->fh, &st);
     if (rc < 0) {
@@ -1754,19 +1960,29 @@ static int smb2fs_utimens(const char *path, const struct timespec tv[2])
 static void smb2fs_trace_setattr_x(const char *op, const char *path,
                                    const struct setattr_x *attr, int ret)
 {
+    unsigned int mode;
+    unsigned long uid;
+    unsigned long gid;
+    long long size;
+    unsigned int flags;
+
     if (!attr) {
         smb2fs_trace_printf("smb2fs trace: %s path=%s attr=null ret=%d\n",
                             op, path ? path : "(null)", ret);
         return;
     }
 
+    mode = SETATTR_WANTS_MODE(attr) ? (unsigned int)attr->mode : 0;
+    uid = SETATTR_WANTS_UID(attr) ? (unsigned long)attr->uid : 0;
+    gid = SETATTR_WANTS_GID(attr) ? (unsigned long)attr->gid : 0;
+    size = SETATTR_WANTS_SIZE(attr) ? (long long)attr->size : -1;
+    flags = SETATTR_WANTS_FLAGS(attr) ? (unsigned int)attr->flags : 0;
+
     smb2fs_trace_printf(
         "smb2fs trace: %s path=%s valid=0x%x mode=0%o uid=%lu gid=%lu "
         "size=%lld flags=0x%x ret=%d\n",
         op, path ? path : "(null)", (unsigned int)attr->valid,
-        (unsigned int)attr->mode, (unsigned long)attr->uid,
-        (unsigned long)attr->gid, (long long)attr->size,
-        (unsigned int)attr->flags, ret);
+        mode, uid, gid, size, flags, ret);
 }
 
 static int smb2fs_setattr_x(const char *path, struct setattr_x *attr)
@@ -1961,6 +2177,7 @@ static int smb2fs_read(const char *path, char *buf, size_t size, off_t offset,
     size_t done = 0;
     uint32_t max_read_size;
     struct smb2fs_handle *handle;
+    int ret;
     (void)path;
     if (offset < 0)
         return -EINVAL;
@@ -1973,12 +2190,15 @@ static int smb2fs_read(const char *path, char *buf, size_t size, off_t offset,
     if (!handle)
         return -EBADF;
 
+    ret = smb2fs_flush_write_buffer(handle);
+    if (ret < 0)
+        return ret;
+
     max_read_size = smb2_get_max_read_size(smb2_ctx);
 
     while (done < size) {
         uint32_t io_size = smb2fs_io_size(size - done, max_read_size);
         uint64_t read_offset;
-        int ret;
 
         if (io_size == 0)
             break;
@@ -2003,11 +2223,8 @@ static int smb2fs_read(const char *path, char *buf, size_t size, off_t offset,
 static int smb2fs_write(const char *path, const char *buf, size_t size,
                         off_t offset, struct fuse_file_info *fi)
 {
-    size_t done = 0;
-    uint32_t max_write_size;
     struct smb2fs_handle *handle;
     struct smb2_stat_64 st;
-    struct smb2fs_async_write_state state;
     uint64_t write_offset;
     int ret = 0;
     (void)path;
@@ -2022,8 +2239,9 @@ static int smb2fs_write(const char *path, const char *buf, size_t size,
 
     if (handle->open_flags & O_APPEND) {
         /* Enforce append in user space so writes do not depend on FUSE/kernel quirks. */
-        int ret;
-
+        ret = smb2fs_flush_write_buffer(handle);
+        if (ret < 0)
+            return ret;
         ret = smb2_stat(smb2_ctx, handle->path, &st);
         if (ret < 0)
             return ret;
@@ -2034,82 +2252,46 @@ static int smb2fs_write(const char *path, const char *buf, size_t size,
         write_offset = (uint64_t)offset;
     }
 
-    max_write_size = smb2_get_max_write_size(smb2_ctx);
-    memset(&state, 0, sizeof(state));
     handle->write_calls++;
     handle->write_bytes += (uint64_t)size;
     if (size > handle->max_write_request)
         handle->max_write_request = size;
 
-    while (done < size) {
-        uint32_t io_size = smb2fs_io_size(size - done, max_write_size);
-        struct smb2fs_async_write_req *req;
-
-        ret = smb2fs_service_until_write_slot(&state, SMB2FS_MAX_ASYNC_WRITES);
-        if (ret < 0)
-            break;
-        if (io_size == 0)
-            break;
-        if (io_size > SMB2FS_MAX_ASYNC_WRITE_SIZE)
-            io_size = SMB2FS_MAX_ASYNC_WRITE_SIZE;
-        if (write_offset > UINT64_MAX - (uint64_t)done) {
-            ret = -EOVERFLOW;
-            break;
-        }
-
-        req = calloc(1, sizeof(*req));
-        if (!req) {
-            ret = -ENOMEM;
-            break;
-        }
-        req->state = &state;
-        req->expected = io_size;
-
-        ret = smb2_pwrite_async(smb2_ctx, handle->fh,
-                                (const uint8_t *)buf + done, io_size,
-                                write_offset + (uint64_t)done,
-                                smb2fs_async_write_cb, req);
-        if (ret < 0) {
-            free(req);
-            break;
-        }
-
-        state.in_flight++;
-        handle->write_submits++;
-        if (state.in_flight > handle->max_write_in_flight)
-            handle->max_write_in_flight = state.in_flight;
-        done += (size_t)io_size;
-    }
-
-    if (state.in_flight > 0) {
-        int drain_ret = smb2fs_drain_async_writes(&state);
-        if (ret == 0 && drain_ret < 0)
-            ret = drain_ret;
-    }
+    ret = smb2fs_buffered_write(handle, (const uint8_t *)buf, size,
+                                write_offset);
     if (ret < 0)
         return ret;
 
-    return (int)done;
+    return (int)size;
 }
 
 static int smb2fs_flush(const char *path, struct fuse_file_info *fi)
 {
+    struct smb2fs_handle *handle;
     (void)path;
-    (void)fi;
 
-    return 0;
+    handle = smb2fs_handle_from_fi(fi);
+    if (!handle)
+        return 0;
+
+    return smb2fs_flush_write_buffer(handle);
 }
 
 static int smb2fs_fsync(const char *path, int datasync,
                         struct fuse_file_info *fi)
 {
     struct smb2fs_handle *handle;
+    int ret;
     (void)path;
     (void)datasync;
 
     handle = smb2fs_handle_from_fi(fi);
     if (!handle)
         return -EBADF;
+
+    ret = smb2fs_flush_write_buffer(handle);
+    if (ret < 0)
+        return ret;
 
     return smb2fs_result(smb2_fsync(smb2_ctx, handle->fh));
 }
@@ -2167,23 +2349,34 @@ static int smb2fs_release(const char *path, struct fuse_file_info *fi)
     if (!handle)
         return -EBADF;
 
+    ret = smb2fs_flush_write_buffer(handle);
+
     if (smb2fs_perf_log && handle->write_calls > 0) {
         smb2fs_perf_printf(
             "smb2fs perf: %s write_bytes=%llu write_calls=%llu "
-            "max_fuse_write=%zu smb_submits=%llu max_in_flight=%d\n",
+            "max_fuse_write=%zu max_backend_write=%zu smb_submits=%llu "
+            "max_in_flight=%d buffered_flushes=%llu\n",
             handle->path ? handle->path : path,
             (unsigned long long)handle->write_bytes,
             (unsigned long long)handle->write_calls,
             handle->max_write_request,
+            handle->max_backend_write_request,
             (unsigned long long)handle->write_submits,
-            handle->max_write_in_flight);
+            handle->max_write_in_flight,
+            (unsigned long long)handle->write_buffer_flushes);
     }
 
-    ret = smb2_close(smb2_ctx, handle->fh);
+    if (ret == 0)
+        ret = smb2fs_result(smb2_close(smb2_ctx, handle->fh));
+    else
+        smb2_close(smb2_ctx, handle->fh);
+    if (smb2fs_active_write_buffer_handle == handle)
+        smb2fs_active_write_buffer_handle = NULL;
+    free(handle->write_buffer);
     free(handle->path);
     free(handle);
     fi->fh = 0;
-    return smb2fs_result(ret);
+    return ret;
 }
 
 static int smb2fs_truncate(const char *path, off_t size)
@@ -2193,6 +2386,10 @@ static int smb2fs_truncate(const char *path, off_t size)
 
     if (!smb_path || size < 0)
         return -EINVAL;
+
+    ret = smb2fs_flush_write_buffer(smb2fs_active_write_buffer_handle);
+    if (ret < 0)
+        return ret;
 
     ret = smb2fs_result(smb2_truncate(smb2_ctx, smb_path, (uint64_t)size));
     smb2fs_trace_printf("smb2fs trace: truncate path=%s size=%lld initial_ret=%d\n",
@@ -2223,6 +2420,13 @@ static int smb2fs_ftruncate(const char *path, off_t size,
         return ret;
     }
 
+    ret = smb2fs_flush_write_buffer(handle);
+    if (ret < 0) {
+        smb2fs_trace_printf("smb2fs trace: ftruncate path=%s size=%lld flush_ret=%d\n",
+                            path ? path : "(null)", (long long)size, ret);
+        return ret;
+    }
+
     ret = smb2fs_result(smb2_ftruncate(smb2_ctx, handle->fh, (uint64_t)size));
     smb2fs_trace_printf("smb2fs trace: ftruncate path=%s size=%lld ret=%d\n",
                         path ? path : "(null)", (long long)size, ret);
@@ -2236,6 +2440,10 @@ static int smb2fs_unlink(const char *path)
 
     if (!smb_path)
         return -EINVAL;
+
+    ret = smb2fs_flush_write_buffer(smb2fs_active_write_buffer_handle);
+    if (ret < 0)
+        return ret;
 
     ret = smb2fs_result(smb2_unlink(smb2_ctx, smb_path));
     smb2fs_trace_printf("smb2fs trace: unlink path=%s ret=%d\n", path, ret);
@@ -2265,8 +2473,14 @@ static int smb2fs_rename(const char *from, const char *to)
 {
     const char *smb_from = smb2path(from);
     const char *smb_to = smb2path(to);
+    int ret;
+
     if (!smb_from || !smb_to)
         return -EINVAL;
+
+    ret = smb2fs_flush_write_buffer(smb2fs_active_write_buffer_handle);
+    if (ret < 0)
+        return ret;
 
     return smb2fs_result(smb2_rename(smb2_ctx, smb_from, smb_to));
 }
